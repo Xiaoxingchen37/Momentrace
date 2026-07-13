@@ -146,14 +146,9 @@ impl Tracker {
             session.paused = true;
         }
         session.last_seen_at = now;
-        if session.manual_pause || idle >= idle_limit {
+        if session.manual_pause {
             if !session.paused {
-                let inactive_ms = idle
-                    .saturating_sub(idle_limit)
-                    .saturating_mul(1_000)
-                    .min(i64::MAX as u64) as i64;
-                let active_until = now.saturating_sub(inactive_ms);
-                self.finish_at(&mut session, active_until);
+                self.finish_at(&mut session, now);
                 session.paused = true;
             }
             return;
@@ -167,11 +162,50 @@ impl Tracker {
             });
         let Some(current) = current else {
             if !session.paused {
-                self.finish_at(&mut session, now);
+                let ended_at = if idle >= idle_limit {
+                    idle_pause_end(
+                        now,
+                        idle,
+                        idle_limit,
+                        session
+                            .app
+                            .as_ref()
+                            .is_some_and(|app| app.continue_tracking_while_idle),
+                    )
+                } else {
+                    now
+                };
+                self.finish_at(&mut session, ended_at);
             }
             session.paused = true;
             return;
         };
+        let app_changed = session
+            .app
+            .as_ref()
+            .is_some_and(|app| app.executable.as_str() != current.executable.as_str());
+        if !session.paused && app_changed {
+            if !self.finish_at(&mut session, now) {
+                return;
+            }
+            session.paused = true;
+        }
+        if should_pause_for_idle(&current, idle, idle_limit) {
+            if !session.paused {
+                let active_until = idle_pause_end(
+                    now,
+                    idle,
+                    idle_limit,
+                    session
+                        .app
+                        .as_ref()
+                        .is_some_and(|app| app.continue_tracking_while_idle),
+                );
+                self.finish_at(&mut session, active_until);
+                session.paused = true;
+            }
+            return;
+        }
         if !session.paused
             && session.app.as_ref().map(|app| app.executable.as_str())
                 == Some(current.executable.as_str())
@@ -241,6 +275,26 @@ impl Tracker {
     }
 }
 
+fn should_pause_for_idle(app: &AppInfo, idle_seconds: u64, idle_limit_seconds: u64) -> bool {
+    idle_seconds >= idle_limit_seconds && !app.continue_tracking_while_idle
+}
+
+fn idle_pause_end(
+    now: i64,
+    idle_seconds: u64,
+    idle_limit_seconds: u64,
+    previously_continued: bool,
+) -> i64 {
+    if previously_continued {
+        return now;
+    }
+    let inactive_ms = idle_seconds
+        .saturating_sub(idle_limit_seconds)
+        .saturating_mul(1_000)
+        .min(i64::MAX as u64) as i64;
+    now.saturating_sub(inactive_ms)
+}
+
 fn idle_seconds() -> u64 {
     unsafe {
         let mut input = LASTINPUTINFO {
@@ -299,8 +353,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn idle_threshold_is_five_minutes_by_default() {
-        assert_eq!(5 * 60, 300);
+    fn per_app_idle_policy_controls_automatic_pause() {
+        let mut app = AppInfo {
+            executable: "test.exe".into(),
+            display_name: "Test".into(),
+            process_path: "C:\\test.exe".into(),
+            category: "其他".into(),
+            ignored: false,
+            continue_tracking_while_idle: false,
+        };
+        assert!(!should_pause_for_idle(&app, 299, 300));
+        assert!(should_pause_for_idle(&app, 300, 300));
+
+        app.continue_tracking_while_idle = true;
+        assert!(!should_pause_for_idle(&app, 3_600, 300));
+        assert_eq!(idle_pause_end(1_000_000, 360, 300, false), 940_000);
+        assert_eq!(idle_pause_end(1_000_000, 360, 300, true), 1_000_000);
     }
 
     #[test]
@@ -315,6 +383,7 @@ mod tests {
             process_path: "C:\\test.exe".into(),
             category: "其他".into(),
             ignored: false,
+            continue_tracking_while_idle: false,
         };
         store
             .append_session(&app, now - 10_000, now - 5_000)

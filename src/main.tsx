@@ -1,11 +1,12 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import momentraceLogo from "./assets/momentrace-logo.png";
 import {
   ArrowUpRight,
   CalendarRange,
+  ChevronLeft,
   ChevronRight,
   Clock3,
   Focus,
@@ -14,9 +15,11 @@ import {
   Monitor,
   Pause,
   Play,
+  Plus,
   Settings2,
   Sparkles,
   Tags,
+  Trash2,
   X,
 } from "lucide-react";
 import {
@@ -69,8 +72,8 @@ type Rule = {
   executable: string;
   displayName: string;
   categoryId?: number | null;
-  category: string;
   ignored: boolean;
+  continueTrackingWhileIdle: boolean;
 };
 type FontFamily = "classic" | "serif" | "sans";
 type Config = {
@@ -98,6 +101,7 @@ const shiftDate = (value: string, days: number) => {
   return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
 };
 const dashboardPages = ["today", "range", "all", "categories", "settings"];
+const APPLICATIONS_PER_PAGE = 7;
 const storedPage = () => {
   const value = localStorage.getItem("momentrace.dashboard.page");
   return value && dashboardPages.includes(value) ? value : "today";
@@ -315,8 +319,28 @@ function Dashboard() {
             ? "把时间归于意义。"
             : "让记录顺其自然。";
   const saveRule = async (rule: Rule, patch: Partial<Rule>) => {
-    await invokeSafe("update_app_rule", { rule: { ...rule, ...patch } });
-    await load();
+    setRules((current) =>
+      current.map((item) =>
+        item.executable === rule.executable ? { ...item, ...patch } : item,
+      ),
+    );
+    try {
+      await invokeSafe("update_app_rule", {
+        executable: rule.executable,
+        patch: {
+          displayName: patch.displayName,
+          categoryId: patch.categoryId,
+          categoryIdChanged: Object.prototype.hasOwnProperty.call(
+            patch,
+            "categoryId",
+          ),
+          ignored: patch.ignored,
+          continueTrackingWhileIdle: patch.continueTrackingWhileIdle,
+        },
+      });
+    } finally {
+      await load();
+    }
   };
   return (
     <main className="shell">
@@ -420,19 +444,36 @@ function Dashboard() {
             )}
             <button
               className="header-status"
+              disabled={!status}
               onClick={() =>
-                invokeSafe("set_tracking_paused", { paused: !status?.paused })
+                status &&
+                invokeSafe("set_tracking_paused", {
+                  paused: status.tracking,
+                })
               }
             >
               <span
-                className={status?.paused ? "status-dot paused" : "status-dot"}
+                className={
+                  status?.tracking === false ? "status-dot paused" : "status-dot"
+                }
               />
-              {status?.paused ? "暂停中" : "专注记录中"}
+              {status?.tracking === false
+                ? "手动暂停中"
+                : status?.paused
+                  ? "空闲暂停中"
+                  : "专注记录中"}
             </button>
           </div>
         </header>
         {page === "today" || page === "range" || page === "all" ? (
           <Overview
+            key={
+              page === "today"
+                ? `day-${date}`
+                : page === "range"
+                  ? `range-${rangeStart}-${rangeEnd}`
+                  : "all"
+            }
             data={page === "all" ? all : page === "range" ? range : day}
             period={page === "all" ? "all" : page === "range" ? "range" : "day"}
             current={status?.currentApp}
@@ -444,9 +485,18 @@ function Dashboard() {
         {page === "settings" ? (
           <Settings
             settings={settings}
+            categories={categories}
             save={async (next) => {
               await invokeSafe("update_settings", { settings: next });
               setSettings(next);
+            }}
+            createCategory={async (name, color) => {
+              await invokeSafe("create_category", { name, color });
+              await load();
+            }}
+            deleteCategory={async (id) => {
+              await invokeSafe("delete_category", { id });
+              await load();
             }}
             clear={async () => {
               if (confirm("这会永久删除所有本地使用记录，确定继续吗？")) {
@@ -470,6 +520,7 @@ function Overview({
   period: "day" | "range" | "all";
   current?: AppInfo | null;
 }) {
+  const [appPage, setAppPage] = useState(0);
   const isRange = period === "range";
   const isAll = period === "all";
   const total =
@@ -486,7 +537,19 @@ function Overview({
       : isAll
         ? (data as All)?.months
         : (data as Range)?.days;
-  const peak = useMemo(() => apps[0], [apps]);
+  const peak = apps[0];
+  const appPageCount = Math.max(
+    1,
+    Math.ceil(apps.length / APPLICATIONS_PER_PAGE),
+  );
+  const safeAppPage = Math.min(appPage, appPageCount - 1);
+  const visibleApps = apps.slice(
+    safeAppPage * APPLICATIONS_PER_PAGE,
+    (safeAppPage + 1) * APPLICATIONS_PER_PAGE,
+  );
+  useEffect(() => {
+    setAppPage((current) => Math.min(current, appPageCount - 1));
+  }, [appPageCount]);
   const topShare = total && peak ? Math.round((peak.seconds / total) * 100) : 0;
   return (
     <>
@@ -693,31 +756,65 @@ function Overview({
             <small>{apps.length} 项</small>
           </div>
           {apps.length ? (
-            <div className="app-list">
-              {apps.slice(0, 7).map((app, index) => (
-                <div className="app-row" key={`${app.name}-${index}`}>
-                  <span className="app-rank">
-                    {String(index + 1).padStart(2, "0")}
-                  </span>
-                  <AppIcon
-                    name={app.name}
-                    path={app.processPath}
-                    size="normal"
-                  />
-                  <div className="app-copy">
-                    <b>{app.name}</b>
-                    <span>
-                      <i />
-                      <em
-                        style={{
-                          width: `${Math.max(8, (app.seconds / Math.max(peak?.seconds ?? 1, 1)) * 100)}%`,
-                        }}
-                      />
+            <div
+              className={`app-archive${appPageCount > 1 ? " paginated" : ""}`}
+            >
+              <div className="app-list">
+                {visibleApps.map((app, index) => (
+                  <div
+                    className="app-row"
+                    key={app.executable ?? app.name}
+                  >
+                    <span className="app-rank">
+                      {String(
+                        safeAppPage * APPLICATIONS_PER_PAGE + index + 1,
+                      ).padStart(2, "0")}
                     </span>
+                    <AppIcon
+                      name={app.name}
+                      path={app.processPath}
+                      size="normal"
+                    />
+                    <div className="app-copy">
+                      <b>{app.name}</b>
+                      <span>
+                        <i />
+                        <em
+                          style={{
+                            width: `${Math.max(8, (app.seconds / Math.max(peak?.seconds ?? 1, 1)) * 100)}%`,
+                          }}
+                        />
+                      </span>
+                    </div>
+                    <strong>{formatShort(app.seconds)}</strong>
                   </div>
-                  <strong>{formatShort(app.seconds)}</strong>
+                ))}
+              </div>
+              {appPageCount > 1 ? (
+                <div className="app-pagination">
+                  <button
+                    type="button"
+                    title="上一页"
+                    aria-label="应用档案上一页"
+                    disabled={safeAppPage === 0}
+                    onClick={() => setAppPage(safeAppPage - 1)}
+                  >
+                    <ChevronLeft size={16} />
+                  </button>
+                  <span>
+                    {safeAppPage + 1} / {appPageCount}
+                  </span>
+                  <button
+                    type="button"
+                    title="下一页"
+                    aria-label="应用档案下一页"
+                    disabled={safeAppPage === appPageCount - 1}
+                    onClick={() => setAppPage(safeAppPage + 1)}
+                  >
+                    <ChevronRight size={16} />
+                  </button>
                 </div>
-              ))}
+              ) : null}
             </div>
           ) : (
             <div className="empty-state">
@@ -771,6 +868,7 @@ function Categories({
       <div className="rule-head">
         <span>应用</span>
         <span>归属分类</span>
+        <span>空闲续记</span>
         <span>忽略</span>
       </div>
       {rules.map((rule) => (
@@ -811,6 +909,7 @@ function Categories({
             </div>
           </div>
           <select
+            className="rule-category-select"
             value={rule.categoryId ?? ""}
             onChange={(event) =>
               save(rule, {
@@ -827,6 +926,19 @@ function Categories({
               </option>
             ))}
           </select>
+          <label className="switch" title="无键鼠操作时仍继续记录">
+            <input
+              aria-label={`空闲时继续记录 ${rule.displayName}`}
+              type="checkbox"
+              checked={rule.continueTrackingWhileIdle}
+              onChange={(event) =>
+                save(rule, {
+                  continueTrackingWhileIdle: event.target.checked,
+                })
+              }
+            />
+            <span />
+          </label>
           <label className="switch">
             <input
               aria-label={`忽略 ${rule.displayName}`}
@@ -845,13 +957,21 @@ function Categories({
 }
 function Settings({
   settings,
+  categories,
   save,
+  createCategory,
+  deleteCategory,
   clear,
 }: {
   settings?: Config;
+  categories: Category[];
   save: (settings: Config) => Promise<void>;
+  createCategory: (name: string, color: string) => Promise<void>;
+  deleteCategory: (id: number) => Promise<void>;
   clear: () => Promise<void>;
 }) {
+  const [categoryName, setCategoryName] = useState("");
+  const [categoryColor, setCategoryColor] = useState("#6E8CFF");
   if (!settings) return null;
   return (
     <article className="glass-card settings">
@@ -1012,6 +1132,67 @@ function Settings({
           </button>
         </div>
       </label>
+      <div className="category-manager-setting">
+        <div>
+          <span className="eyebrow">分类管理</span>
+          <b>自定义分类</b>
+          <small>删除后，相关应用会自动归入其他</small>
+        </div>
+        <div className="category-manager">
+          <div className="category-manager-list">
+            {categories.map((category) => (
+              <span className="category-manager-item" key={category.id}>
+                <i style={{ background: category.color }} />
+                <b>{category.name}</b>
+                <button
+                  type="button"
+                  title={`删除分类 ${category.name}`}
+                  aria-label={`删除分类 ${category.name}`}
+                  onClick={() => {
+                    if (!confirm(`删除“${category.name}”分类？`)) return;
+                    void deleteCategory(category.id).catch((error) =>
+                      alert(String(error)),
+                    );
+                  }}
+                >
+                  <Trash2 size={14} />
+                </button>
+              </span>
+            ))}
+          </div>
+          <form
+            className="category-create-form"
+            onSubmit={(event) => {
+              event.preventDefault();
+              const name = categoryName.trim();
+              if (!name) return;
+              void createCategory(name, categoryColor)
+                .then(() => setCategoryName(""))
+                .catch((error) => alert(String(error)));
+            }}
+          >
+            <input
+              className="category-color-input"
+              type="color"
+              aria-label="新分类颜色"
+              value={categoryColor}
+              onChange={(event) => setCategoryColor(event.target.value)}
+            />
+            <input
+              type="text"
+              aria-label="新分类名称"
+              placeholder="分类名称"
+              maxLength={20}
+              value={categoryName}
+              onChange={(event) => setCategoryName(event.target.value)}
+            />
+            <button type="submit" disabled={!categoryName.trim()}>
+              <Plus size={15} />
+              新增
+            </button>
+          </form>
+        </div>
+      </div>
       <div className="danger">
         <div>
           <span className="eyebrow">数据管理</span>

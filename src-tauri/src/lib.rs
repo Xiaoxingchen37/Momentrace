@@ -4,8 +4,8 @@ mod tracker;
 
 use crate::{
     store::{
-        today, AllSummary, AppRule, Category, DaySummary, LiveStatus, MonthSummary, RangeSummary,
-        Settings, Store, WeekSummary, WidgetStatus,
+        today, AllSummary, AppRule, AppRulePatch, Category, DaySummary, LiveStatus, RangeSummary,
+        Settings, Store, WidgetStatus,
     },
     tracker::Tracker,
 };
@@ -54,14 +54,6 @@ fn get_widget_status(state: State<AppState>) -> Result<WidgetStatus, String> {
     state.tracker.widget_status()
 }
 #[tauri::command]
-fn get_week_summary(date: String, state: State<AppState>) -> Result<WeekSummary, String> {
-    state.store.week_summary(&date)
-}
-#[tauri::command]
-fn get_month_summary(date: String, state: State<AppState>) -> Result<MonthSummary, String> {
-    state.store.month_summary(&date)
-}
-#[tauri::command]
 fn get_range_summary(
     start_date: String,
     end_date: String,
@@ -78,12 +70,24 @@ fn get_categories(state: State<AppState>) -> Result<Vec<Category>, String> {
     state.store.categories()
 }
 #[tauri::command]
+fn create_category(name: String, color: String, state: State<AppState>) -> Result<(), String> {
+    state.store.create_category(&name, &color).map(|_| ())
+}
+#[tauri::command]
+fn delete_category(id: i64, state: State<AppState>) -> Result<(), String> {
+    state.store.delete_category(id)
+}
+#[tauri::command]
 fn get_app_rules(state: State<AppState>) -> Result<Vec<AppRule>, String> {
     state.store.rules()
 }
 #[tauri::command]
-fn update_app_rule(rule: AppRule, state: State<AppState>) -> Result<(), String> {
-    state.store.update_rule(&rule)
+fn update_app_rule(
+    executable: String,
+    patch: AppRulePatch,
+    state: State<AppState>,
+) -> Result<(), String> {
+    state.store.update_rule(&executable, &patch)
 }
 #[tauri::command]
 fn get_settings(state: State<AppState>) -> Result<Settings, String> {
@@ -436,11 +440,11 @@ pub fn run() {
             get_live_status,
             get_day_summary,
             get_widget_status,
-            get_week_summary,
-            get_month_summary,
             get_range_summary,
             get_all_summary,
             get_categories,
+            create_category,
+            delete_category,
             get_app_rules,
             update_app_rule,
             get_settings,

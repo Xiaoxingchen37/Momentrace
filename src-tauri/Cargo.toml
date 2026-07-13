@@ -1,0 +1,41 @@
+[package]
+name = "momentrace"
+version = "0.1.0"
+description = "A private, local-first Windows app usage tracker"
+authors = ["You"]
+edition = "2021"
+
+[lib]
+name = "screen_time_lib"
+crate-type = ["cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2.5", features = [] }
+
+[dependencies]
+base64 = "0.22"
+chrono = { version = "0.4", features = ["serde"] }
+dirs = "6"
+image = { version = "0.25", default-features = false, features = ["png"] }
+parking_lot = "0.12"
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tauri = { version = "2.9", features = ["tray-icon"] }
+tauri-plugin-autostart = "2.5"
+tauri-plugin-single-instance = "2"
+thiserror = "2"
+windows61 = { package = "windows", version = "0.61", features = ["Win32_Graphics_Gdi", "Win32_UI_WindowsAndMessaging"] }
+windows = { version = "0.58", features = [
+  "Win32_Foundation",
+  "Win32_Graphics_Gdi",
+  "Win32_Storage_FileSystem",
+  "Win32_System_Threading",
+  "Win32_System_SystemInformation",
+  "Win32_UI_Input_KeyboardAndMouse",
+  "Win32_UI_Shell",
+  "Win32_UI_WindowsAndMessaging"
+] }
+
+[dev-dependencies]
+tempfile = "3"

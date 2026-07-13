@@ -6,6 +6,7 @@
 
 .env
 .env.*
+*.env
 !.env.example
 .npmrc
 

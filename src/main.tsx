@@ -30,6 +30,8 @@ import {
   XAxis,
   YAxis,
 } from "recharts";
+import "@fontsource-variable/noto-sans-sc";
+import "@fontsource-variable/noto-serif-sc";
 import "./styles.css";
 
 type Item = {
@@ -70,10 +72,15 @@ type Rule = {
   category: string;
   ignored: boolean;
 };
+type FontFamily = "classic" | "serif" | "sans";
 type Config = {
   idleMinutes: number;
   launchAtLogin: boolean;
   showWidget: boolean;
+  fontFamily: FontFamily;
+  widgetHeight: number;
+  widgetXOffset: number;
+  widgetYOffset: number;
 };
 
 const formatDuration = (value = 0) =>
@@ -95,6 +102,15 @@ const storedPage = () => {
   const value = localStorage.getItem("momentrace.dashboard.page");
   return value && dashboardPages.includes(value) ? value : "today";
 };
+const normalizeFontFamily = (value?: string | null): FontFamily =>
+  value === "serif" || value === "sans" ? value : "classic";
+const applyFontFamily = (value?: string | null) => {
+  const fontFamily = normalizeFontFamily(value);
+  document.documentElement.dataset.font = fontFamily;
+  localStorage.setItem("momentrace.fontFamily", fontFamily);
+};
+
+applyFontFamily(localStorage.getItem("momentrace.fontFamily"));
 
 function AppIcon({
   name,
@@ -161,10 +177,17 @@ function Widget() {
     const task = listen<Status>("tracker-status", () => {
       void refresh();
     });
+    void invokeSafe<Config>("get_settings")
+      .then((settings) => applyFontFamily(settings.fontFamily))
+      .catch(() => undefined);
+    const fontTask = listen<string>("font-family-changed", (event) =>
+      applyFontFamily(event.payload),
+    );
     return () => {
       document.body.classList.remove("widget-view");
       window.clearInterval(timer);
       void task.then((unlisten) => unlisten());
+      void fontTask.then((unlisten) => unlisten());
     };
   }, []);
   const current = status.currentApp;
@@ -211,6 +234,9 @@ function Dashboard() {
     localStorage.setItem("momentrace.dashboard.rangeStart", rangeStart);
     localStorage.setItem("momentrace.dashboard.rangeEnd", rangeEnd);
   }, [page, date, rangeStart, rangeEnd]);
+  useEffect(() => {
+    if (settings) applyFontFamily(settings.fontFamily);
+  }, [settings?.fontFamily]);
   const load = async () => {
     const requestId = ++loadId.current;
     try {
@@ -831,6 +857,26 @@ function Settings({
     <article className="glass-card settings">
       <label>
         <div>
+          <span className="eyebrow">界面字体</span>
+          <b>字体风格</b>
+          <small>字体随安装包提供，切换后立即生效</small>
+        </div>
+        <select
+          value={settings.fontFamily}
+          onChange={(event) =>
+            save({
+              ...settings,
+              fontFamily: event.target.value as FontFamily,
+            })
+          }
+        >
+          <option value="classic">原版设计（默认）</option>
+          <option value="serif">思源宋体</option>
+          <option value="sans">思源黑体</option>
+        </select>
+      </label>
+      <label>
+        <div>
           <span className="eyebrow">自动暂停</span>
           <b>空闲暂停阈值</b>
           <small>连续无键鼠操作后停止记录</small>
@@ -882,6 +928,89 @@ function Settings({
           />
           <span />
         </label>
+      </label>
+      <label className="widget-geometry-setting">
+        <div>
+          <span className="eyebrow">悬浮窗适配</span>
+          <b>尺寸与位置</b>
+          <small>相对自动贴合位置，以逻辑像素精确调整</small>
+        </div>
+        <div className="widget-geometry-controls">
+          <span>
+            <small>高度</small>
+            <input
+              type="number"
+              aria-label="悬浮窗高度"
+              min={48}
+              max={160}
+              step={1}
+              value={settings.widgetHeight}
+              onChange={(event) =>
+                save({
+                  ...settings,
+                  widgetHeight: Math.min(
+                    160,
+                    Math.max(48, Number(event.target.value) || 48),
+                  ),
+                })
+              }
+            />
+          </span>
+          <span>
+            <small>水平</small>
+            <input
+              type="number"
+              aria-label="悬浮窗水平偏移"
+              min={-1000}
+              max={1000}
+              step={1}
+              value={settings.widgetXOffset}
+              onChange={(event) =>
+                save({
+                  ...settings,
+                  widgetXOffset: Math.min(
+                    1000,
+                    Math.max(-1000, Number(event.target.value) || 0),
+                  ),
+                })
+              }
+            />
+          </span>
+          <span>
+            <small>垂直</small>
+            <input
+              type="number"
+              aria-label="悬浮窗垂直偏移"
+              min={-1000}
+              max={1000}
+              step={1}
+              value={settings.widgetYOffset}
+              onChange={(event) =>
+                save({
+                  ...settings,
+                  widgetYOffset: Math.min(
+                    1000,
+                    Math.max(-1000, Number(event.target.value) || 0),
+                  ),
+                })
+              }
+            />
+          </span>
+          <button
+            type="button"
+            onClick={(event) => {
+              event.preventDefault();
+              void save({
+                ...settings,
+                widgetHeight: 64,
+                widgetXOffset: 0,
+                widgetYOffset: 0,
+              });
+            }}
+          >
+            重置
+          </button>
+        </div>
       </label>
       <div className="danger">
         <div>

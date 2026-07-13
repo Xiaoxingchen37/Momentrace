@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Momentrace",
-  "version": "0.1.0",
-  "identifier": "com.local.screentime",
+  "version": "0.2.0",
+  "identifier": "com.local.momentrace",
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1420",
@@ -34,6 +34,9 @@
   "bundle": {
     "active": true,
     "targets": "all",
+    "resources": [
+      "../THIRD_PARTY_LICENSES.md"
+    ],
     "icon": [
       "icons/icon.png",
       "icons/icon.ico"

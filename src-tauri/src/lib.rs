@@ -20,7 +20,7 @@ use std::{
 use tauri::{
     menu::{Menu, MenuItem},
     tray::TrayIconBuilder,
-    AppHandle, Emitter, Manager, PhysicalPosition, RunEvent, State, WebviewUrl,
+    AppHandle, Emitter, LogicalSize, Manager, PhysicalPosition, RunEvent, State, WebviewUrl,
     WebviewWindowBuilder,
 };
 #[cfg(windows)]
@@ -97,8 +97,10 @@ fn update_settings(
 ) -> Result<(), String> {
     sync_autostart(&app, settings.launch_at_login)?;
     state.store.update_settings(&settings)?;
+    let saved_settings = state.store.settings()?;
     state.tracker.set_idle_minutes(settings.idle_minutes);
     set_widget_visibility(&app, settings.show_widget);
+    let _ = app.emit("font-family-changed", saved_settings.font_family);
     Ok(())
 }
 #[tauri::command]
@@ -175,7 +177,12 @@ fn sync_autostart(app: &AppHandle, enabled: bool) -> Result<(), String> {
 }
 
 #[cfg(windows)]
-fn widget_position(window: &tauri::WebviewWindow) -> Option<PhysicalPosition<i32>> {
+fn widget_position(
+    window: &tauri::WebviewWindow,
+    height: i32,
+    x_offset: i32,
+    y_offset: i32,
+) -> Option<PhysicalPosition<i32>> {
     let hwnd = window.hwnd().ok()?;
     unsafe {
         let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
@@ -188,8 +195,6 @@ fn widget_position(window: &tauri::WebviewWindow) -> Option<PhysicalPosition<i32
         }
         let monitor_rect = info.rcMonitor;
         let work_rect = info.rcWork;
-        let size = window.outer_size().ok()?;
-        let height = size.height as i32;
         let bottom_taskbar = work_rect.bottom < monitor_rect.bottom;
         let top_taskbar = work_rect.top > monitor_rect.top;
         let taskbar_height = if bottom_taskbar {
@@ -199,7 +204,7 @@ fn widget_position(window: &tauri::WebviewWindow) -> Option<PhysicalPosition<i32
         } else {
             0
         };
-        let x = work_rect.left;
+        let x = work_rect.left + x_offset;
         let vertical_offset = 12;
         let y = if bottom_taskbar {
             work_rect.bottom + ((taskbar_height - height).max(0) / 2) - vertical_offset
@@ -208,12 +213,17 @@ fn widget_position(window: &tauri::WebviewWindow) -> Option<PhysicalPosition<i32
         } else {
             work_rect.bottom - height - vertical_offset
         };
-        Some(PhysicalPosition::new(x, y))
+        Some(PhysicalPosition::new(x, y + y_offset))
     }
 }
 
 #[cfg(not(windows))]
-fn widget_position(_: &tauri::WebviewWindow) -> Option<PhysicalPosition<i32>> {
+fn widget_position(
+    _: &tauri::WebviewWindow,
+    _: i32,
+    _: i32,
+    _: i32,
+) -> Option<PhysicalPosition<i32>> {
     None
 }
 
@@ -248,7 +258,21 @@ fn anchor_widget_to_taskbar(app: &AppHandle) {
     let Some(window) = app.get_webview_window("widget") else {
         return;
     };
-    if let Some(position) = widget_position(&window) {
+    let settings = app.state::<AppState>().store.settings().ok();
+    let height = settings.as_ref().map_or(64, |value| value.widget_height);
+    let x_offset = settings.as_ref().map_or(0, |value| value.widget_x_offset);
+    let y_offset = settings.as_ref().map_or(0, |value| value.widget_y_offset);
+    let scale = window.scale_factor().unwrap_or(1.0);
+    let _ = window.set_size(LogicalSize::new(292.0, height as f64));
+    let physical_height = (height as f64 * scale).round() as i32;
+    let physical_x_offset = (x_offset as f64 * scale).round() as i32;
+    let physical_y_offset = (y_offset as f64 * scale).round() as i32;
+    if let Some(position) = widget_position(
+        &window,
+        physical_height,
+        physical_x_offset,
+        physical_y_offset,
+    ) {
         let _ = window.set_position(position);
     }
     let _ = window.set_shadow(false);
@@ -370,6 +394,10 @@ pub fn run() {
                 idle_minutes: 5,
                 launch_at_login: false,
                 show_widget: true,
+                font_family: "classic".into(),
+                widget_height: 64,
+                widget_x_offset: 0,
+                widget_y_offset: 0,
             });
             app.manage(AppState {
                 store,

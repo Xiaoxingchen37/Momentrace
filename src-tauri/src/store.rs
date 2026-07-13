@@ -4,6 +4,8 @@ use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use std::{fs, path::Path, sync::Arc};
 
+const DATABASE_FILENAME: &str = "momentrace.sqlite3";
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AppInfo {
@@ -106,6 +108,10 @@ pub struct Settings {
     pub idle_minutes: u32,
     pub launch_at_login: bool,
     pub show_widget: bool,
+    pub font_family: String,
+    pub widget_height: u32,
+    pub widget_x_offset: i32,
+    pub widget_y_offset: i32,
 }
 
 pub struct Store {
@@ -115,8 +121,8 @@ pub struct Store {
 impl Store {
     pub fn open(data_dir: &Path) -> Result<Arc<Self>, String> {
         fs::create_dir_all(data_dir).map_err(|err| err.to_string())?;
-        let connection = Connection::open(data_dir.join("screen-time.sqlite3"))
-            .map_err(|err| err.to_string())?;
+        let connection =
+            Connection::open(data_dir.join(DATABASE_FILENAME)).map_err(|err| err.to_string())?;
         connection
             .busy_timeout(std::time::Duration::from_secs(5))
             .map_err(|err| err.to_string())?;
@@ -162,6 +168,24 @@ impl Store {
                 [],
             )
             .map_err(|err| err.to_string())?;
+        connection
+            .execute(
+                "INSERT OR IGNORE INTO settings(key, value) VALUES ('font_family', 'classic')",
+                [],
+            )
+            .map_err(|err| err.to_string())?;
+        for (key, value) in [
+            ("widget_height", "64"),
+            ("widget_x_offset", "0"),
+            ("widget_y_offset", "0"),
+        ] {
+            connection
+                .execute(
+                    "INSERT OR IGNORE INTO settings(key, value) VALUES (?1, ?2)",
+                    params![key, value],
+                )
+                .map_err(|err| err.to_string())?;
+        }
         Ok(Arc::new(Self {
             connection: Mutex::new(connection),
         }))
@@ -277,10 +301,42 @@ impl Store {
                 |row| row.get(0),
             )
             .map_err(|err| err.to_string())?;
+        let font_family: String = connection
+            .query_row(
+                "SELECT value FROM settings WHERE key='font_family'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|err| err.to_string())?;
+        let widget_height: String = connection
+            .query_row(
+                "SELECT value FROM settings WHERE key='widget_height'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|err| err.to_string())?;
+        let widget_x_offset: String = connection
+            .query_row(
+                "SELECT value FROM settings WHERE key='widget_x_offset'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|err| err.to_string())?;
+        let widget_y_offset: String = connection
+            .query_row(
+                "SELECT value FROM settings WHERE key='widget_y_offset'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|err| err.to_string())?;
         Ok(Settings {
             idle_minutes: idle.parse().unwrap_or(5),
             launch_at_login: autostart == "true",
             show_widget: show_widget == "true",
+            font_family: normalize_font_family(&font_family).into(),
+            widget_height: widget_height.parse().unwrap_or(64).clamp(48, 160),
+            widget_x_offset: widget_x_offset.parse().unwrap_or(0).clamp(-1000, 1000),
+            widget_y_offset: widget_y_offset.parse().unwrap_or(0).clamp(-1000, 1000),
         })
     }
 
@@ -303,8 +359,35 @@ impl Store {
                 "UPDATE settings SET value=?1 WHERE key='show_widget'",
                 params![settings.show_widget.to_string()],
             )
-            .map(|_| ())
-            .map_err(|err| err.to_string())
+            .map_err(|err| err.to_string())?;
+        connection
+            .execute(
+                "UPDATE settings SET value=?1 WHERE key='font_family'",
+                params![normalize_font_family(&settings.font_family)],
+            )
+            .map_err(|err| err.to_string())?;
+        for (key, value) in [
+            (
+                "widget_height",
+                settings.widget_height.clamp(48, 160).to_string(),
+            ),
+            (
+                "widget_x_offset",
+                settings.widget_x_offset.clamp(-1000, 1000).to_string(),
+            ),
+            (
+                "widget_y_offset",
+                settings.widget_y_offset.clamp(-1000, 1000).to_string(),
+            ),
+        ] {
+            connection
+                .execute(
+                    "UPDATE settings SET value=?1 WHERE key=?2",
+                    params![value, key],
+                )
+                .map_err(|err| err.to_string())?;
+        }
+        Ok(())
     }
 
     fn range(date: &str) -> Result<(i64, i64), String> {
@@ -631,6 +714,14 @@ pub fn today() -> String {
     Local::now().format("%Y-%m-%d").to_string()
 }
 
+fn normalize_font_family(value: &str) -> &'static str {
+    match value {
+        "serif" => "serif",
+        "sans" => "sans",
+        _ => "classic",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -655,6 +746,28 @@ mod tests {
             "INSERT INTO sessions(executable, display_name, process_path, started_at, ended_at) VALUES ('test.exe', 'Test', 'C:\\test.exe', ?1, ?2)",
             params![started_at, ended_at],
         ).unwrap();
+    }
+
+    #[test]
+    fn font_family_setting_is_persisted_and_validated() {
+        let (_directory, store) = test_store();
+        let mut settings = store.settings().unwrap();
+        assert_eq!(settings.font_family, "classic");
+
+        settings.font_family = "serif".into();
+        store.update_settings(&settings).unwrap();
+        assert_eq!(store.settings().unwrap().font_family, "serif");
+
+        settings.font_family = "untrusted-value".into();
+        settings.widget_height = 999;
+        settings.widget_x_offset = -5000;
+        settings.widget_y_offset = 5000;
+        store.update_settings(&settings).unwrap();
+        let settings = store.settings().unwrap();
+        assert_eq!(settings.font_family, "classic");
+        assert_eq!(settings.widget_height, 160);
+        assert_eq!(settings.widget_x_offset, -1000);
+        assert_eq!(settings.widget_y_offset, 1000);
     }
 
     #[test]

@@ -1,7 +1,7 @@
 {
   "name": "momentrace",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -10,6 +10,8 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@fontsource-variable/noto-sans-sc": "^5.2.10",
+    "@fontsource-variable/noto-serif-sc": "^5.2.10",
     "@tauri-apps/api": "^2.9.0",
     "@tauri-apps/plugin-autostart": "^2.5.0",
     "@tauri-apps/plugin-opener": "^2.5.0",

@@ -21,4 +21,4 @@ npm run tauri dev
 npm run tauri build
 ```
 
-All data is stored in the user-local app-data directory under `com.local.screentime`.
+All data is stored in the user-local app-data directory under `com.local.momentrace`.

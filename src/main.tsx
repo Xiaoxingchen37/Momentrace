@@ -57,7 +57,6 @@ type Status = {
   idleSeconds: number;
   currentApp?: AppInfo | null;
 };
-type WidgetStatus = Status & { currentAppSeconds?: number | null };
 type Day = {
   date: string;
   totalSeconds: number;
@@ -145,74 +144,6 @@ function AppIcon({
   );
 }
 
-function Widget() {
-  const [status, setStatus] = useState<Status>({
-    tracking: true,
-    paused: false,
-    idleSeconds: 0,
-  });
-  const [display, setDisplay] = useState<{
-    app: AppInfo;
-    seconds: number;
-  } | null>(null);
-  const refreshId = useRef(0);
-  useEffect(() => {
-    document.body.classList.add("widget-view");
-    const refresh = async () => {
-      const requestId = ++refreshId.current;
-      try {
-        const nextStatus = await invokeSafe<WidgetStatus>("get_widget_status");
-        if (requestId !== refreshId.current) return;
-        setStatus(nextStatus);
-        if (nextStatus.currentApp && nextStatus.currentAppSeconds != null) {
-          setDisplay({
-            app: nextStatus.currentApp,
-            seconds: nextStatus.currentAppSeconds,
-          });
-        } else {
-          setDisplay(null);
-        }
-      } catch {
-        // Keep the last stable display while the tracker is updating.
-      }
-    };
-    void refresh();
-    const timer = window.setInterval(() => void refresh(), 5000);
-    const task = listen<Status>("tracker-status", () => {
-      void refresh();
-    });
-    void invokeSafe<Config>("get_settings")
-      .then((settings) => applyFontFamily(settings.fontFamily))
-      .catch(() => undefined);
-    const fontTask = listen<string>("font-family-changed", (event) =>
-      applyFontFamily(event.payload),
-    );
-    return () => {
-      document.body.classList.remove("widget-view");
-      window.clearInterval(timer);
-      void task.then((unlisten) => unlisten());
-      void fontTask.then((unlisten) => unlisten());
-    };
-  }, []);
-  const current = status.currentApp;
-  return (
-    <main className="taskbar-overlay">
-      <AppIcon
-        name={current?.displayName ?? "时迹"}
-        path={current?.processPath}
-        size="small"
-      />
-      <div className="taskbar-app-copy">
-        <b>
-          {current?.displayName ??
-            (status.paused ? "已暂停记录" : "等待应用活动")}
-        </b>
-        <span>{current?.category ?? "本地记录"}</span>
-      </div>
-      <strong>{formatShort(current ? display?.seconds : 0)}</strong>
-    </main>
-  );
-}
 function Dashboard() {
   const [page, setPage] = useState(storedPage);
   const [date, setDate] = useState(
@@ -1206,10 +1137,4 @@ function Settings({
 }
 
 const root = createRoot(document.getElementById("root")!);
-root.render(
-  new URLSearchParams(location.search).get("view") === "widget" ? (
-    <Widget />
-  ) : (
-    <Dashboard />
-  ),
-);
+root.render(<Dashboard />);

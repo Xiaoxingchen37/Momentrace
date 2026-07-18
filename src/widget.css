@@ -1,0 +1,159 @@
+@font-face {
+  font-family: "Source Han Serif SC VF";
+  src:
+    local("Source Han Serif SC VF"),
+    local("Source Han Serif SC"),
+    local("Noto Serif CJK SC");
+  font-display: swap;
+}
+
+:root {
+  --ui-font: "Microsoft YaHei UI", "Noto Sans SC Variable", sans-serif;
+  --display-font: "Noto Serif SC Variable", serif;
+  color: #20293c;
+  background: transparent;
+  font-family: var(--ui-font);
+}
+
+:root[data-font="serif"] {
+  --ui-font: "Noto Serif SC Variable", serif;
+  --display-font: "Noto Serif SC Variable", serif;
+}
+
+:root[data-font="sans"] {
+  --ui-font: "Noto Sans SC Variable", sans-serif;
+  --display-font: "Noto Sans SC Variable", sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body.widget-view,
+body.widget-view #root {
+  width: 100vw;
+  height: 100vh;
+  margin: 0;
+  overflow: hidden;
+  background: transparent;
+}
+
+body.widget-view {
+  min-width: 0;
+}
+
+body.widget-view .taskbar-overlay {
+  display: grid;
+  grid-template-columns: 40px minmax(0, max-content) max-content;
+  align-items: center;
+  justify-content: start;
+  gap: 12px;
+  width: 100vw;
+  height: 100vh;
+  padding: 0 10px;
+  overflow: hidden;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+  color: #20293c;
+  pointer-events: none;
+}
+
+body.widget-view .taskbar-overlay .app-icon {
+  display: grid;
+  place-items: center;
+  flex: 0 0 auto;
+  width: 40px;
+  height: 40px;
+  overflow: hidden;
+  border: 1px solid rgb(255 255 255 / 94%);
+  border-radius: 11px;
+  background: #fff;
+  box-shadow: 0 4px 12px rgb(40 72 105 / 12%);
+  color: #27769f;
+  font: 700 15px "Source Han Serif SC VF", serif;
+}
+
+body.widget-view .taskbar-overlay .app-icon img {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  padding: 2px;
+  background: #fff;
+}
+
+body.widget-view .taskbar-app-copy {
+  display: grid;
+  min-width: 0;
+  gap: 3px;
+  align-content: center;
+}
+
+body.widget-view .taskbar-app-copy b {
+  display: block;
+  max-width: 100%;
+  margin: 0;
+  overflow: hidden;
+  color: #20293c;
+  font: 700 16px/1.05 Inter, "Microsoft YaHei UI", sans-serif;
+  text-overflow: ellipsis;
+  text-shadow: none;
+  white-space: nowrap;
+}
+
+body.widget-view .taskbar-app-copy span {
+  margin: 0;
+  overflow: hidden;
+  color: #9aa3b3;
+  font: 500 12px/1.05 "Source Han Serif SC VF", "Microsoft YaHei UI", sans-serif;
+  letter-spacing: 0;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+body.widget-view .taskbar-overlay > strong {
+  align-self: center;
+  color: #1686ef;
+  font: 500 21px/1 "Source Han Serif SC VF", "Microsoft YaHei UI", sans-serif;
+  letter-spacing: 0;
+  white-space: nowrap;
+}
+
+:root[data-font="classic"] body.widget-view .taskbar-app-copy b {
+  font-family: var(--ui-font);
+}
+
+:root[data-font="classic"] body.widget-view .taskbar-app-copy span,
+:root[data-font="classic"] body.widget-view .taskbar-overlay > strong {
+  font-family: var(--display-font);
+}
+
+:root[data-font="serif"] body.widget-view *,
+:root[data-font="sans"] body.widget-view * {
+  font-family: var(--ui-font);
+}
+
+@media (prefers-color-scheme: dark) {
+  body.widget-view .taskbar-overlay .app-icon,
+  body.widget-view .taskbar-overlay .app-icon img {
+    background: #2b2d32;
+  }
+
+  body.widget-view .taskbar-overlay .app-icon {
+    border-color: #3d4149;
+  }
+
+  body.widget-view .taskbar-app-copy b {
+    color: #f5f6f8;
+  }
+
+  body.widget-view .taskbar-app-copy span {
+    color: #abb4c2;
+  }
+
+  body.widget-view .taskbar-overlay > strong {
+    color: #57a7ff;
+  }
+}

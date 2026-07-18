@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Momentrace",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "identifier": "com.local.momentrace",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -14,7 +14,7 @@
       {
         "label": "widget",
         "title": "Momentrace · 当前应用",
-        "url": "index.html?view=widget",
+        "url": "widget.html",
         "width": 292,
         "height": 64,
         "resizable": false,

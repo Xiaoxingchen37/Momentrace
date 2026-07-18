@@ -294,6 +294,10 @@ fn set_widget_visibility(app: &AppHandle, visible: bool) {
         anchor_widget_to_taskbar(app);
         let _ = window.show();
         anchor_widget_to_taskbar(app);
+        let state = app.state::<AppState>();
+        if let Ok(status) = state.tracker.widget_status() {
+            let _ = app.emit_to("widget", "widget-status", status);
+        }
     } else {
         let _ = window.hide();
     }
@@ -425,11 +429,15 @@ pub fn run() {
                 let main_visible = handle
                     .get_webview_window("main")
                     .is_some_and(|window| window.is_visible().unwrap_or(false));
-                if widget_visible || main_visible {
+                if main_visible {
                     let state = handle.state::<AppState>();
                     let _ = handle.emit("tracker-status", state.tracker.status());
                 }
                 if widget_visible {
+                    let state = handle.state::<AppState>();
+                    if let Ok(status) = state.tracker.widget_status() {
+                        let _ = handle.emit_to("widget", "widget-status", status);
+                    }
                     anchor_widget_to_taskbar(&handle);
                 }
                 std::thread::sleep(Duration::from_secs(5));

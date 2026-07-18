@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Allow Momentrace windows to receive application events.",
+  "windows": ["main", "widget"],
+  "permissions": ["core:event:default"]
+}

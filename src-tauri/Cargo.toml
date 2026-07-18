@@ -1,6 +1,6 @@
 [package]
 name = "momentrace"
-version = "0.2.1"
+version = "0.2.2"
 description = "A private, local-first Windows app usage tracker"
 authors = ["You"]
 edition = "2021"

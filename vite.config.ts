@@ -5,5 +5,13 @@ export default defineConfig({
   plugins: [react()],
   clearScreen: false,
   server: { port: 1420, strictPort: true },
-  envPrefix: ["VITE_", "TAURI_ENV_"]
+  envPrefix: ["VITE_", "TAURI_ENV_"],
+  build: {
+    rollupOptions: {
+      input: {
+        main: "index.html",
+        widget: "widget.html"
+      }
+    }
+  }
 });

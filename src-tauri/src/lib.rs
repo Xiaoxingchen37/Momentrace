@@ -120,13 +120,37 @@ fn get_today() -> String {
     today()
 }
 #[tauri::command]
-fn get_app_icon(process_path: String, state: State<AppState>) -> Result<String, String> {
-    if let Some(icon) = state.icons.lock().get(&process_path).cloned() {
-        return Ok(icon);
+fn get_app_icon(
+    process_path: Option<String>,
+    executable: Option<String>,
+    state: State<AppState>,
+) -> Result<String, String> {
+    let mut paths = process_path
+        .filter(|path| !path.trim().is_empty())
+        .into_iter()
+        .collect::<Vec<_>>();
+    if let Some(executable) = executable.filter(|value| !value.trim().is_empty()) {
+        for path in state.store.icon_paths(&executable)? {
+            if !paths.iter().any(|value| value == &path) {
+                paths.push(path);
+            }
+        }
     }
-    let icon = app_icon::from_executable(&process_path)?;
-    state.icons.lock().insert(process_path, icon.clone());
-    Ok(icon)
+
+    let mut last_error = None;
+    for path in paths {
+        if let Some(icon) = state.icons.lock().get(&path).cloned() {
+            return Ok(icon);
+        }
+        match app_icon::from_executable(&path) {
+            Ok(icon) => {
+                state.icons.lock().insert(path, icon.clone());
+                return Ok(icon);
+            }
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| "Application path is unavailable".into()))
 }
 
 #[tauri::command]

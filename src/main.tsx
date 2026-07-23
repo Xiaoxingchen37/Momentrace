@@ -70,6 +70,7 @@ type Category = { id: number; name: string; color: string };
 type Rule = {
   executable: string;
   displayName: string;
+  processPath: string;
   categoryId?: number | null;
   ignored: boolean;
   continueTrackingWhileIdle: boolean;
@@ -118,17 +119,23 @@ applyFontFamily(localStorage.getItem("momentrace.fontFamily"));
 function AppIcon({
   name,
   path,
+  executable,
   size = "normal",
 }: {
   name: string;
   path?: string | null;
+  executable?: string | null;
   size?: "small" | "normal" | "large";
 }) {
   const [icon, setIcon] = useState<string>();
   useEffect(() => {
     let active = true;
-    if (!path) return;
-    invokeSafe<string>("get_app_icon", { processPath: path })
+    setIcon(undefined);
+    if (!path && !executable) return;
+    invokeSafe<string>("get_app_icon", {
+      processPath: path,
+      executable,
+    })
       .then((value) => {
         if (active) setIcon(value);
       })
@@ -136,7 +143,7 @@ function AppIcon({
     return () => {
       active = false;
     };
-  }, [path]);
+  }, [path, executable]);
   return (
     <span className={`app-icon ${size}`}>
       {icon ? <img src={icon} alt="" /> : initials(name)}
@@ -311,6 +318,7 @@ function Dashboard() {
             <AppIcon
               name={status?.currentApp?.displayName ?? "时迹"}
               path={status?.currentApp?.processPath}
+              executable={status?.currentApp?.executable}
               size="small"
             />
             <div>
@@ -527,6 +535,7 @@ function Overview({
             <AppIcon
               name={current?.displayName ?? "等待活动"}
               path={current?.processPath}
+              executable={current?.executable}
               size="large"
             />
             <div>
@@ -544,7 +553,12 @@ function Overview({
           </div>
           <div className="focus-app">
             {peak ? (
-              <AppIcon name={peak.name} path={peak.processPath} size="normal" />
+              <AppIcon
+                name={peak.name}
+                path={peak.processPath}
+                executable={peak.executable}
+                size="normal"
+              />
             ) : (
               <span className="app-icon normal">•</span>
             )}
@@ -704,6 +718,7 @@ function Overview({
                     <AppIcon
                       name={app.name}
                       path={app.processPath}
+                      executable={app.executable}
                       size="normal"
                     />
                     <div className="app-copy">
@@ -805,7 +820,12 @@ function Categories({
       {rules.map((rule) => (
         <div className="rule-row" key={rule.executable}>
           <div className="rule-app">
-            <AppIcon name={rule.displayName} size="normal" />
+            <AppIcon
+              name={rule.displayName}
+              path={rule.processPath}
+              executable={rule.executable}
+              size="normal"
+            />
             <div>
               {editing === rule.executable ? (
                 <input

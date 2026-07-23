@@ -85,6 +85,7 @@ pub struct Category {
 pub struct AppRule {
     pub executable: String,
     pub display_name: String,
+    pub process_path: String,
     pub category_id: Option<i64>,
     pub ignored: bool,
     #[serde(default)]
@@ -357,21 +358,57 @@ impl Store {
 
     pub fn rules(&self) -> Result<Vec<AppRule>, String> {
         let connection = self.connection.lock();
-        let mut statement = connection.prepare("SELECT executable, display_name, category_id, ignored, continue_tracking_while_idle FROM app_rules ORDER BY display_name COLLATE NOCASE").map_err(|err| err.to_string())?;
+        let mut statement = connection.prepare("SELECT executable, display_name, process_path, category_id, ignored, continue_tracking_while_idle FROM app_rules ORDER BY display_name COLLATE NOCASE").map_err(|err| err.to_string())?;
         let rules = statement
             .query_map([], |row| {
                 Ok(AppRule {
                     executable: row.get(0)?,
                     display_name: row.get(1)?,
-                    category_id: row.get(2)?,
-                    ignored: row.get::<_, i64>(3)? != 0,
-                    continue_tracking_while_idle: row.get::<_, i64>(4)? != 0,
+                    process_path: row.get(2)?,
+                    category_id: row.get(3)?,
+                    ignored: row.get::<_, i64>(4)? != 0,
+                    continue_tracking_while_idle: row.get::<_, i64>(5)? != 0,
                 })
             })
             .map_err(|err| err.to_string())?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|err| err.to_string())?;
         Ok(rules)
+    }
+
+    pub fn icon_paths(&self, executable: &str) -> Result<Vec<String>, String> {
+        let connection = self.connection.lock();
+        let mut paths = Vec::new();
+        let mut add_path = |path: String| {
+            if !path.trim().is_empty() && !paths.iter().any(|value| value == &path) {
+                paths.push(path);
+            }
+        };
+
+        if let Some(path) = connection
+            .query_row(
+                "SELECT process_path FROM app_rules WHERE executable = ?1",
+                params![executable],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|err| err.to_string())?
+        {
+            add_path(path);
+        }
+
+        let mut statement = connection
+            .prepare(
+                "SELECT process_path FROM sessions WHERE executable = ?1 ORDER BY ended_at DESC, id DESC",
+            )
+            .map_err(|err| err.to_string())?;
+        let session_paths = statement
+            .query_map(params![executable], |row| row.get::<_, String>(0))
+            .map_err(|err| err.to_string())?;
+        for path in session_paths {
+            add_path(path.map_err(|err| err.to_string())?);
+        }
+        Ok(paths)
     }
 
     pub fn update_rule(&self, executable: &str, patch: &AppRulePatch) -> Result<(), String> {
@@ -719,7 +756,7 @@ impl Store {
         let (start, end) = Self::range(date)?;
         let total: i64 = self.connection.lock().query_row("SELECT COALESCE(SUM(MAX(0, MIN(ended_at, ?2) - MAX(started_at, ?1)) / 1000), 0) FROM sessions WHERE ended_at>?1 AND started_at<?2", params![start, end], |row| row.get(0)).map_err(|err| err.to_string())?;
         let categories = self.grouped("SELECT COALESCE(c.name, '其他'), COALESCE(SUM(MAX(0, MIN(s.ended_at, ?2) - MAX(s.started_at, ?1)) / 1000),0), COALESCE(c.color, '#8391A5') FROM sessions s LEFT JOIN app_rules r ON r.executable=s.executable LEFT JOIN categories c ON c.id=r.category_id WHERE s.ended_at>?1 AND s.started_at<?2 GROUP BY c.name, c.color ORDER BY 2 DESC, 1 COLLATE NOCASE", &[&start, &end])?;
-        let applications = self.application_usage("SELECT COALESCE(r.display_name, s.display_name), COALESCE(SUM(MAX(0, MIN(s.ended_at, ?2) - MAX(s.started_at, ?1)) / 1000),0), s.executable, MAX(s.process_path) FROM sessions s LEFT JOIN app_rules r ON r.executable=s.executable WHERE s.ended_at>?1 AND s.started_at<?2 GROUP BY s.executable, r.display_name ORDER BY 2 DESC, 1 COLLATE NOCASE, s.executable COLLATE NOCASE", &[&start, &end])?;
+        let applications = self.application_usage("SELECT COALESCE(r.display_name, s.display_name), COALESCE(SUM(MAX(0, MIN(s.ended_at, ?2) - MAX(s.started_at, ?1)) / 1000),0), s.executable, COALESCE(r.process_path, MAX(s.process_path)) FROM sessions s LEFT JOIN app_rules r ON r.executable=s.executable WHERE s.ended_at>?1 AND s.started_at<?2 GROUP BY s.executable, r.display_name ORDER BY 2 DESC, 1 COLLATE NOCASE, s.executable COLLATE NOCASE", &[&start, &end])?;
         let parsed_date =
             NaiveDate::parse_from_str(date, "%Y-%m-%d").map_err(|err| err.to_string())?;
         let hours = self.hour_usage(parsed_date)?;
@@ -760,7 +797,7 @@ impl Store {
             label,
         )?;
         let categories = self.grouped("SELECT COALESCE(c.name, '其他'), SUM(MAX(0, MIN(s.ended_at, ?2) - MAX(s.started_at, ?1)) / 1000), COALESCE(c.color, '#8391A5') FROM sessions s LEFT JOIN app_rules r ON r.executable=s.executable LEFT JOIN categories c ON c.id=r.category_id WHERE s.ended_at>?1 AND s.started_at<?2 GROUP BY c.name,c.color ORDER BY 2 DESC, 1 COLLATE NOCASE", &[&start, &end])?;
-        let applications = self.application_usage("SELECT COALESCE(r.display_name, s.display_name), SUM(MAX(0, MIN(s.ended_at, ?2) - MAX(s.started_at, ?1)) / 1000), s.executable, MAX(s.process_path) FROM sessions s LEFT JOIN app_rules r ON r.executable=s.executable WHERE s.ended_at>?1 AND s.started_at<?2 GROUP BY s.executable, r.display_name ORDER BY 2 DESC, 1 COLLATE NOCASE, s.executable COLLATE NOCASE", &[&start, &end])?;
+        let applications = self.application_usage("SELECT COALESCE(r.display_name, s.display_name), SUM(MAX(0, MIN(s.ended_at, ?2) - MAX(s.started_at, ?1)) / 1000), s.executable, COALESCE(r.process_path, MAX(s.process_path)) FROM sessions s LEFT JOIN app_rules r ON r.executable=s.executable WHERE s.ended_at>?1 AND s.started_at<?2 GROUP BY s.executable, r.display_name ORDER BY 2 DESC, 1 COLLATE NOCASE, s.executable COLLATE NOCASE", &[&start, &end])?;
         Ok(RangeSummary {
             days,
             categories,
@@ -771,7 +808,7 @@ impl Store {
     pub fn all_summary(&self) -> Result<AllSummary, String> {
         let months = self.all_month_usage()?;
         let categories = self.grouped("SELECT COALESCE(c.name, '其他'), SUM((s.ended_at-s.started_at)/1000), COALESCE(c.color, '#8391A5') FROM sessions s LEFT JOIN app_rules r ON r.executable=s.executable LEFT JOIN categories c ON c.id=r.category_id GROUP BY c.name,c.color ORDER BY 2 DESC, 1 COLLATE NOCASE", &[])?;
-        let applications = self.application_usage("SELECT COALESCE(r.display_name, s.display_name), SUM((s.ended_at-s.started_at)/1000), s.executable, MAX(s.process_path) FROM sessions s LEFT JOIN app_rules r ON r.executable=s.executable GROUP BY s.executable, r.display_name ORDER BY 2 DESC, 1 COLLATE NOCASE, s.executable COLLATE NOCASE", &[])?;
+        let applications = self.application_usage("SELECT COALESCE(r.display_name, s.display_name), SUM((s.ended_at-s.started_at)/1000), s.executable, COALESCE(r.process_path, MAX(s.process_path)) FROM sessions s LEFT JOIN app_rules r ON r.executable=s.executable GROUP BY s.executable, r.display_name ORDER BY 2 DESC, 1 COLLATE NOCASE, s.executable COLLATE NOCASE", &[])?;
         Ok(AllSummary {
             months,
             categories,
@@ -1031,6 +1068,44 @@ mod tests {
         assert_eq!(saved.display_name, "Custom");
         assert!(saved.ignored);
         assert!(saved.continue_tracking_while_idle);
+    }
+
+    #[test]
+    fn icon_paths_prefer_the_current_rule_path_and_keep_recent_fallbacks() {
+        let (_directory, store) = test_store();
+        let start = local_ms(2026, 7, 13, 12, 0, 0);
+        store
+            .rule_for("icon.exe", "Icon", "D:\\current\\icon.exe")
+            .unwrap();
+        {
+            let connection = store.connection.lock();
+            connection
+                .execute(
+                    "INSERT INTO sessions(executable, display_name, process_path, started_at, ended_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params!["icon.exe", "Icon", "C:\\old\\icon.exe", start, start + 1_000],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO sessions(executable, display_name, process_path, started_at, ended_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params!["icon.exe", "Icon", "E:\\recent\\icon.exe", start + 2_000, start + 3_000],
+                )
+                .unwrap();
+        }
+
+        assert_eq!(
+            store.icon_paths("icon.exe").unwrap(),
+            [
+                "D:\\current\\icon.exe",
+                "E:\\recent\\icon.exe",
+                "C:\\old\\icon.exe",
+            ]
+        );
+        let applications = store.all_summary().unwrap().applications;
+        assert_eq!(
+            applications[0].process_path.as_deref(),
+            Some("D:\\current\\icon.exe")
+        );
     }
 
     #[test]

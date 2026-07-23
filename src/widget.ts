@@ -48,7 +48,7 @@ const category = root.querySelector<HTMLElement>(".taskbar-app-copy span")!;
 const elapsed = root.querySelector<HTMLElement>(".taskbar-overlay > strong")!;
 
 let iconRequestId = 0;
-let currentIconPath: string | null = null;
+let currentIconSource: string | null = null;
 let statusRevision = 0;
 
 const normalizeFontFamily = (value?: string | null): FontFamily =>
@@ -74,21 +74,29 @@ const showIconFallback = (name: string) => {
   iconFallback.hidden = false;
 };
 
-const updateIcon = async (name: string, processPath?: string | null) => {
+const updateIcon = async (
+  name: string,
+  processPath?: string | null,
+  executable?: string | null,
+) => {
   const path = processPath || null;
-  if (path === currentIconPath) {
-    if (!path || iconImage.hidden) showIconFallback(name);
+  const source = `${path ?? ""}\u0000${executable ?? ""}`;
+  if (source === currentIconSource) {
+    if ((!path && !executable) || iconImage.hidden) showIconFallback(name);
     return;
   }
 
-  currentIconPath = path;
+  currentIconSource = source;
   const requestId = ++iconRequestId;
   showIconFallback(name);
-  if (!path) return;
+  if (!path && !executable) return;
 
   try {
-    const icon = await invoke<string>("get_app_icon", { processPath: path });
-    if (requestId !== iconRequestId || path !== currentIconPath) return;
+    const icon = await invoke<string>("get_app_icon", {
+      processPath: path,
+      executable,
+    });
+    if (requestId !== iconRequestId || source !== currentIconSource) return;
     iconImage.src = icon;
     iconImage.hidden = false;
     iconFallback.hidden = true;
@@ -103,7 +111,7 @@ const render = (status: WidgetStatus) => {
   appName.textContent = name;
   category.textContent = current?.category ?? "本地记录";
   elapsed.textContent = formatShort(current ? (status.currentAppSeconds ?? 0) : 0);
-  void updateIcon(name, current?.processPath);
+  void updateIcon(name, current?.processPath, current?.executable);
 };
 
 applyFontFamily(localStorage.getItem("momentrace.fontFamily"));

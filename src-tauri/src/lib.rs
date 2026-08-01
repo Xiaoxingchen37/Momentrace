@@ -38,6 +38,7 @@ struct AppState {
     tracker: Arc<Tracker>,
     icons: parking_lot::Mutex<HashMap<String, String>>,
     widget_menu: parking_lot::Mutex<Option<MenuItem<tauri::Wry>>>,
+    widget_geometry: parking_lot::Mutex<Option<(u32, i32, i32)>>,
     main_window_creating: AtomicBool,
 }
 
@@ -99,8 +100,11 @@ fn update_settings(
     app: AppHandle,
     state: State<AppState>,
 ) -> Result<(), String> {
-    sync_autostart(&app, settings.launch_at_login)?;
     state.store.update_settings(&settings)?;
+    state.widget_geometry.lock().take();
+    if let Err(err) = sync_autostart(&app, settings.launch_at_login) {
+        eprintln!("Unable to synchronize autostart: {err}");
+    }
     let saved_settings = state.store.settings()?;
     state.tracker.set_idle_minutes(settings.idle_minutes);
     set_widget_visibility(&app, settings.show_widget);
@@ -286,10 +290,7 @@ fn anchor_widget_to_taskbar(app: &AppHandle) {
     let Some(window) = app.get_webview_window("widget") else {
         return;
     };
-    let settings = app.state::<AppState>().store.settings().ok();
-    let height = settings.as_ref().map_or(64, |value| value.widget_height);
-    let x_offset = settings.as_ref().map_or(0, |value| value.widget_x_offset);
-    let y_offset = settings.as_ref().map_or(0, |value| value.widget_y_offset);
+    let (height, x_offset, y_offset) = widget_geometry(app);
     let scale = window.scale_factor().unwrap_or(1.0);
     let _ = window.set_size(LogicalSize::new(292.0, height as f64));
     let physical_height = (height as f64 * scale).round() as i32;
@@ -308,6 +309,23 @@ fn anchor_widget_to_taskbar(app: &AppHandle) {
     let _ = window.set_ignore_cursor_events(true);
     let _ = window.set_always_on_top(true);
     reinforce_widget_layer(&window);
+}
+
+fn widget_geometry(app: &AppHandle) -> (u32, i32, i32) {
+    let state = app.state::<AppState>();
+    if let Some(cached) = *state.widget_geometry.lock() {
+        return cached;
+    }
+    let Some(settings) = state.store.settings().ok() else {
+        return (64, 0, 0);
+    };
+    let geometry = (
+        settings.widget_height,
+        settings.widget_x_offset,
+        settings.widget_y_offset,
+    );
+    state.widget_geometry.lock().replace(geometry);
+    geometry
 }
 
 fn set_widget_visibility(app: &AppHandle, visible: bool) {
@@ -436,6 +454,7 @@ pub fn run() {
                 tracker,
                 icons: parking_lot::Mutex::new(HashMap::new()),
                 widget_menu: parking_lot::Mutex::new(None),
+                widget_geometry: parking_lot::Mutex::new(None),
                 main_window_creating: AtomicBool::new(false),
             });
             if let Err(err) = sync_autostart(app.handle(), settings.launch_at_login) {

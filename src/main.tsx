@@ -3,6 +3,7 @@ import { listen } from "@tauri-apps/api/event";
 import { useEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import momentraceLogo from "./assets/momentrace-logo.png";
+import { getIconBackground } from "./icon-background";
 import {
   ArrowUpRight,
   CalendarRange,
@@ -127,7 +128,7 @@ function AppIcon({
   executable?: string | null;
   size?: "small" | "normal" | "large";
 }) {
-  const [icon, setIcon] = useState<string>();
+  const [icon, setIcon] = useState<{ source: string; background: string }>();
   useEffect(() => {
     let active = true;
     setIcon(undefined);
@@ -136,8 +137,9 @@ function AppIcon({
       processPath: path,
       executable,
     })
-      .then((value) => {
-        if (active) setIcon(value);
+      .then(async (value) => {
+        const background = await getIconBackground(value);
+        if (active) setIcon({ source: value, background });
       })
       .catch(() => undefined);
     return () => {
@@ -145,8 +147,15 @@ function AppIcon({
     };
   }, [path, executable]);
   return (
-    <span className={`app-icon ${size}`}>
-      {icon ? <img src={icon} alt="" /> : initials(name)}
+    <span
+      className={`app-icon ${size}`}
+      style={
+        {
+          "--app-icon-background": icon?.background ?? "#ffffff",
+        } as React.CSSProperties
+      }
+    >
+      {icon ? <img src={icon.source} alt="" /> : initials(name)}
     </span>
   );
 }
@@ -220,9 +229,39 @@ function Dashboard() {
       console.error("Unable to load dashboard data", error);
     }
   };
+  const refresh = async () => {
+    const requestId = loadId.current;
+    try {
+      const live = await invokeSafe<Status>("get_live_status");
+      let nextDay: Day | undefined;
+      let nextRange: Range | undefined;
+      let nextAll: All | undefined;
+      if (page === "today") {
+        nextDay = await invokeSafe<Day>("get_day_summary", {
+          date: date || (await invokeSafe<string>("get_today")),
+        });
+      } else if (page === "range") {
+        const selectedEnd =
+          rangeEnd || date || (await invokeSafe<string>("get_today"));
+        nextRange = await invokeSafe<Range>("get_range_summary", {
+          startDate: rangeStart || shiftDate(selectedEnd, -6),
+          endDate: selectedEnd,
+        });
+      } else if (page === "all") {
+        nextAll = await invokeSafe<All>("get_all_summary");
+      }
+      if (requestId !== loadId.current) return;
+      setStatus(live);
+      if (nextDay) setDay(nextDay);
+      if (nextRange) setRange(nextRange);
+      if (nextAll) setAll(nextAll);
+    } catch (error) {
+      console.error("Unable to refresh dashboard data", error);
+    }
+  };
   useEffect(() => {
     void load();
-    const timer = window.setInterval(() => void load(), 30_000);
+    const timer = window.setInterval(() => void refresh(), 30_000);
     const nav = listen<string>("navigate", (event) => setPage(event.payload));
     const live = listen<Status>("tracker-status", (event) =>
       setStatus(event.payload),
@@ -238,7 +277,7 @@ function Dashboard() {
       void live.then((unlisten) => unlisten());
       void widget.then((unlisten) => unlisten());
     };
-  }, [date, rangeStart, rangeEnd]);
+  }, [page, date, rangeStart, rangeEnd]);
   const nav = [
     { id: "today", label: "今天", icon: Clock3 },
     { id: "range", label: "时间段", icon: CalendarRange },
@@ -276,6 +315,8 @@ function Dashboard() {
           continueTrackingWhileIdle: patch.continueTrackingWhileIdle,
         },
       });
+    } catch (error) {
+      alert(String(error));
     } finally {
       await load();
     }
@@ -386,9 +427,9 @@ function Dashboard() {
               disabled={!status}
               onClick={() =>
                 status &&
-                invokeSafe("set_tracking_paused", {
+                void invokeSafe("set_tracking_paused", {
                   paused: status.tracking,
-                })
+                }).catch((error) => alert(String(error)))
               }
             >
               <span
@@ -426,8 +467,12 @@ function Dashboard() {
             settings={settings}
             categories={categories}
             save={async (next) => {
-              await invokeSafe("update_settings", { settings: next });
-              setSettings(next);
+              try {
+                await invokeSafe("update_settings", { settings: next });
+                setSettings(next);
+              } catch (error) {
+                alert(String(error));
+              }
             }}
             createCategory={async (name, color) => {
               await invokeSafe("create_category", { name, color });
@@ -439,8 +484,12 @@ function Dashboard() {
             }}
             clear={async () => {
               if (confirm("这会永久删除所有本地使用记录，确定继续吗？")) {
-                await invokeSafe("clear_usage_data");
-                await load();
+                try {
+                  await invokeSafe("clear_usage_data");
+                  await load();
+                } catch (error) {
+                  alert(String(error));
+                }
               }
             }}
           />

@@ -77,10 +77,11 @@ impl Tracker {
     pub fn widget_status(&self) -> Result<WidgetStatus, String> {
         let session = self.session.lock();
         let current_app = session.app.clone();
+        let today_start = self.store.today_start_ms()?;
         let current_app_seconds = match current_app.as_ref() {
             Some(app) if !session.paused && !app.ignored => Some(
                 self.store.today_app_seconds(&app.executable)?
-                    + (now_ms() - session.started_at).max(0) / 1000,
+                    + (now_ms() - session.started_at.max(today_start)).max(0) / 1000,
             ),
             _ => None,
         };

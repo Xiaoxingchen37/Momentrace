@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import "@fontsource-variable/noto-sans-sc";
 import "@fontsource-variable/noto-serif-sc";
+import { getIconBackground } from "./icon-background";
 import "./widget.css";
 
 type AppInfo = {
@@ -42,6 +43,7 @@ root.innerHTML = `
 `;
 
 const iconImage = root.querySelector<HTMLImageElement>(".app-icon img")!;
+const iconContainer = root.querySelector<HTMLElement>(".app-icon")!;
 const iconFallback = root.querySelector<HTMLElement>(".app-icon-fallback")!;
 const appName = root.querySelector<HTMLElement>(".taskbar-app-copy b")!;
 const category = root.querySelector<HTMLElement>(".taskbar-app-copy span")!;
@@ -68,6 +70,7 @@ const formatShort = (value = 0) =>
     : `${Math.max(0, Math.round(value / 60))}分`;
 
 const showIconFallback = (name: string) => {
+  iconContainer.style.setProperty("--app-icon-background", "#ffffff");
   iconImage.hidden = true;
   iconImage.removeAttribute("src");
   iconFallback.textContent = initials(name);
@@ -96,7 +99,9 @@ const updateIcon = async (
       processPath: path,
       executable,
     });
+    const background = await getIconBackground(icon);
     if (requestId !== iconRequestId || source !== currentIconSource) return;
+    iconContainer.style.setProperty("--app-icon-background", background);
     iconImage.src = icon;
     iconImage.hidden = false;
     iconFallback.hidden = true;

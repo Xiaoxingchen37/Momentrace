@@ -70,7 +70,7 @@ body.widget-view .taskbar-overlay .app-icon {
   overflow: hidden;
   border: 1px solid rgb(255 255 255 / 94%);
   border-radius: 11px;
-  background: #fff;
+  background: var(--app-icon-background, #fff);
   box-shadow: 0 4px 12px rgb(40 72 105 / 12%);
   color: #27769f;
   font: 700 15px "Source Han Serif SC VF", serif;
@@ -81,7 +81,7 @@ body.widget-view .taskbar-overlay .app-icon img {
   height: 100%;
   object-fit: contain;
   padding: 2px;
-  background: #fff;
+  background: var(--app-icon-background, #fff);
 }
 
 body.widget-view .taskbar-app-copy {
@@ -136,11 +136,6 @@ body.widget-view .taskbar-overlay > strong {
 }
 
 @media (prefers-color-scheme: dark) {
-  body.widget-view .taskbar-overlay .app-icon,
-  body.widget-view .taskbar-overlay .app-icon img {
-    background: #2b2d32;
-  }
-
   body.widget-view .taskbar-overlay .app-icon {
     border-color: #3d4149;
   }

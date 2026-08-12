@@ -323,17 +323,28 @@ fn foreground_app() -> Option<(u32, String, String, String)> {
             return None;
         }
         let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, BOOL(0), process_id).ok()?;
-        let mut buffer = [0u16; 32768];
-        let mut length = buffer.len() as u32;
-        let query = QueryFullProcessImageNameW(
-            process,
-            PROCESS_NAME_FORMAT(0),
-            PWSTR(buffer.as_mut_ptr()),
-            &mut length,
-        );
+        // Windows paths are almost always well under MAX_PATH; the retry covers
+        // the rare long-path case without allocating 64 KB every second.
+        let mut buffer = vec![0u16; 260];
+        let path = loop {
+            let mut length = buffer.len() as u32;
+            let query = QueryFullProcessImageNameW(
+                process,
+                PROCESS_NAME_FORMAT(0),
+                PWSTR(buffer.as_mut_ptr()),
+                &mut length,
+            );
+            if query.is_ok() {
+                break String::from_utf16_lossy(&buffer[..length as usize]);
+            }
+            if buffer.len() >= 32_768 {
+                let _ = CloseHandle(process);
+                return None;
+            }
+            buffer.resize(buffer.len() * 4, 0);
+        };
         let _ = CloseHandle(process);
-        query.ok()?;
-        let path = PathBuf::from(String::from_utf16_lossy(&buffer[..length as usize]));
+        let path = PathBuf::from(path);
         let executable = path.file_name()?.to_string_lossy().to_string();
         let display_name = path
             .file_stem()

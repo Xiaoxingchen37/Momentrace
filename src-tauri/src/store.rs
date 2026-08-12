@@ -117,6 +117,10 @@ pub struct Settings {
 
 pub struct Store {
     connection: Mutex<Connection>,
+    /// Caches the resolved rule per executable so the once-per-second tracker
+    /// poll does not re-run three statements while the foreground app is stable.
+    /// Invalidated whenever rules or categories change.
+    rules_cache: Mutex<std::collections::HashMap<String, AppInfo>>,
 }
 
 impl Store {
@@ -234,10 +238,29 @@ impl Store {
         }
         Ok(Arc::new(Self {
             connection: Mutex::new(connection),
+            rules_cache: Mutex::new(std::collections::HashMap::new()),
         }))
     }
 
     pub fn rule_for(
+        &self,
+        executable: &str,
+        display_name: &str,
+        process_path: &str,
+    ) -> Result<AppInfo, String> {
+        if let Some(cached) = self.rules_cache.lock().get(executable) {
+            if cached.process_path == process_path {
+                return Ok(cached.clone());
+            }
+        }
+        let info = self.load_rule(executable, display_name, process_path)?;
+        self.rules_cache
+            .lock()
+            .insert(executable.to_owned(), info.clone());
+        Ok(info)
+    }
+
+    fn load_rule(
         &self,
         executable: &str,
         display_name: &str,
@@ -277,6 +300,10 @@ impl Store {
         ).map_err(|err| err.to_string())
     }
 
+    fn invalidate_rules_cache(&self) {
+        self.rules_cache.lock().clear();
+    }
+
     pub fn append_session(
         &self,
         app: &AppInfo,
@@ -288,8 +315,8 @@ impl Store {
         }
         let connection = self.connection.lock();
         let previous: Option<(i64, i64)> = connection.query_row(
-            "SELECT id, ended_at FROM sessions WHERE executable=?1 AND display_name=?2 ORDER BY ended_at DESC LIMIT 1", params![app.executable, app.display_name], |row| Ok((row.get(0)?, row.get(1)?))
-        ).ok();
+            "SELECT id, ended_at FROM sessions WHERE executable=?1 AND display_name=?2 ORDER BY started_at DESC LIMIT 1", params![app.executable, app.display_name], |row| Ok((row.get(0)?, row.get(1)?))
+        ).optional().map_err(|err| err.to_string())?;
         if let Some((id, previous_end)) = previous {
             if previous_end == started_at {
                 return connection
@@ -378,7 +405,10 @@ impl Store {
         transaction
             .execute("DELETE FROM categories WHERE id = ?1", params![id])
             .map_err(|err| err.to_string())?;
-        transaction.commit().map_err(|err| err.to_string())
+        transaction.commit().map_err(|err| err.to_string())?;
+        drop(connection);
+        self.invalidate_rules_cache();
+        Ok(())
     }
 
     pub fn rules(&self) -> Result<Vec<AppRule>, String> {
@@ -423,8 +453,8 @@ impl Store {
         }
 
         let mut statement = connection
-            .prepare(
-                "SELECT process_path FROM sessions WHERE executable = ?1 ORDER BY ended_at DESC, id DESC LIMIT 8",
+            .prepare_cached(
+                "SELECT process_path FROM sessions WHERE executable = ?1 ORDER BY started_at DESC LIMIT 8",
             )
             .map_err(|err| err.to_string())?;
         let session_paths = statement
@@ -468,8 +498,10 @@ impl Store {
                 "UPDATE app_rules SET display_name=?1, category_id=?2, ignored=?3, continue_tracking_while_idle=?4 WHERE executable=?5",
                 params![display_name, category_id, ignored as i64, continue_tracking_while_idle as i64, executable],
             )
-            .map(|_| ())
-            .map_err(|err| err.to_string())
+            .map_err(|err| err.to_string())?;
+        drop(connection);
+        self.invalidate_rules_cache();
+        Ok(())
     }
 
     pub fn settings(&self) -> Result<Settings, String> {
@@ -607,57 +639,107 @@ impl Store {
         ))
     }
 
+    fn overlapping_sessions(
+        connection: &Connection,
+        start: i64,
+        end: i64,
+    ) -> Result<Vec<(i64, i64)>, String> {
+        let mut statement = connection
+            .prepare_cached(
+                "SELECT started_at, ended_at FROM sessions WHERE ended_at>?1 AND started_at<?2",
+            )
+            .map_err(|err| err.to_string())?;
+        let sessions = statement
+            .query_map(params![start, end], |row| Ok((row.get(0)?, row.get(1)?)))
+            .map_err(|err| err.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|err| err.to_string())?;
+        Ok(sessions)
+    }
+
+    /// Sums the milliseconds each session contributes to every bucket, then converts
+    /// to seconds so the totals match the clipped per-bucket SQL they replace.
+    /// Buckets must be sorted and non-overlapping, which lets each session skip
+    /// straight to the first bucket it touches instead of scanning all of them.
+    fn bucket_milliseconds(sessions: &[(i64, i64)], buckets: &[(i64, i64)]) -> Vec<i64> {
+        let mut totals = vec![0_i64; buckets.len()];
+        for &(session_start, session_end) in sessions {
+            let first = buckets.partition_point(|bucket| bucket.1 <= session_start);
+            for (index, &(start, end)) in buckets.iter().enumerate().skip(first) {
+                if start >= session_end {
+                    break;
+                }
+                totals[index] += session_end.min(end) - session_start.max(start);
+            }
+        }
+        totals
+    }
+
     fn bucket_usage(
         &self,
         dates: impl IntoIterator<Item = NaiveDate>,
         label: &str,
     ) -> Result<Vec<UsageItem>, String> {
-        let connection = self.connection.lock();
-        let mut statement = connection.prepare(
-            "SELECT COALESCE(SUM(MAX(0, MIN(ended_at, ?2) - MAX(started_at, ?1))) / 1000, 0) FROM sessions WHERE ended_at>?1 AND started_at<?2"
-        ).map_err(|err| err.to_string())?;
-        let mut items = Vec::new();
+        let mut names = Vec::new();
+        let mut buckets = Vec::new();
         for date in dates {
-            let (start, end) = Self::date_range(date)?;
-            let seconds: i64 = statement
-                .query_row(params![start, end], |row| row.get(0))
-                .map_err(|err| err.to_string())?;
-            if seconds > 0 {
-                items.push(UsageItem {
-                    name: date.format(label).to_string(),
+            names.push(date.format(label).to_string());
+            buckets.push(Self::date_range(date)?);
+        }
+        let Some(window) = Self::bucket_window(&buckets) else {
+            return Ok(Vec::new());
+        };
+        let connection = self.connection.lock();
+        let sessions = Self::overlapping_sessions(&connection, window.0, window.1)?;
+        drop(connection);
+        Ok(Self::bucket_milliseconds(&sessions, &buckets)
+            .into_iter()
+            .zip(names)
+            .filter_map(|(milliseconds, name)| {
+                let seconds = milliseconds / 1000;
+                (seconds > 0).then_some(UsageItem {
+                    name,
                     seconds,
                     color: None,
                     executable: None,
                     process_path: None,
-                });
-            }
-        }
-        Ok(items)
+                })
+            })
+            .collect())
+    }
+
+    fn bucket_window(buckets: &[(i64, i64)]) -> Option<(i64, i64)> {
+        let start = buckets.iter().map(|value| value.0).min()?;
+        let end = buckets.iter().map(|value| value.1).max()?;
+        Some((start, end))
     }
 
     fn hour_usage(&self, date: NaiveDate) -> Result<Vec<UsageItem>, String> {
-        let connection = self.connection.lock();
-        let mut statement = connection.prepare(
-            "SELECT COALESCE(SUM(MAX(0, MIN(ended_at, ?2) - MAX(started_at, ?1))) / 1000, 0) FROM sessions WHERE ended_at>?1 AND started_at<?2"
-        ).map_err(|err| err.to_string())?;
         let (day_start, day_end) = Self::date_range(date)?;
-        let mut by_hour = std::collections::BTreeMap::<String, i64>::new();
+        let mut buckets = Vec::new();
         let mut start = day_start;
         while start < day_end {
             let end = start.saturating_add(3_600_000).min(day_end);
-            let seconds: i64 = statement
-                .query_row(params![start, end], |row| row.get(0))
-                .map_err(|err| err.to_string())?;
-            if seconds > 0 {
-                let name = Local
-                    .timestamp_millis_opt(start)
-                    .single()
-                    .ok_or("Unable to determine local hour")?
-                    .format("%H:00")
-                    .to_string();
-                *by_hour.entry(name).or_default() += seconds;
-            }
+            buckets.push((start, end));
             start = end;
+        }
+        let connection = self.connection.lock();
+        let sessions = Self::overlapping_sessions(&connection, day_start, day_end)?;
+        drop(connection);
+        let totals = Self::bucket_milliseconds(&sessions, &buckets);
+        let mut by_hour = std::collections::BTreeMap::<String, i64>::new();
+        for (&(start, _), milliseconds) in buckets.iter().zip(totals) {
+            let seconds = milliseconds / 1000;
+            if seconds <= 0 {
+                continue;
+            }
+            let name = Local
+                .timestamp_millis_opt(start)
+                .single()
+                .ok_or("Unable to determine local hour")?
+                .format("%H:00")
+                .to_string();
+            *by_hour.entry(name).or_default() += seconds;
         }
         Ok(by_hour
             .into_iter()
@@ -680,6 +762,7 @@ impl Store {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .map_err(|err| err.to_string())?;
+        drop(connection);
         let (Some(first), Some(last)) = (first, last) else {
             return Ok(Vec::new());
         };
@@ -690,10 +773,8 @@ impl Store {
             .date_naive();
         let mut month = NaiveDate::from_ymd_opt(first_date.year(), first_date.month(), 1)
             .ok_or("Unable to determine first recorded month")?;
-        let mut statement = connection.prepare(
-            "SELECT COALESCE(SUM(MAX(0, MIN(ended_at, ?2) - MAX(started_at, ?1))) / 1000, 0) FROM sessions WHERE ended_at>?1 AND started_at<?2",
-        ).map_err(|err| err.to_string())?;
-        let mut items = Vec::new();
+        let mut names = Vec::new();
+        let mut buckets = Vec::new();
         loop {
             let next_month = if month.month() == 12 {
                 NaiveDate::from_ymd_opt(month.year() + 1, 1, 1)
@@ -705,22 +786,30 @@ impl Store {
             if start >= last {
                 break;
             }
-            let end = Self::date_range(next_month)?.0;
-            let seconds: i64 = statement
-                .query_row(params![start, end], |row| row.get(0))
-                .map_err(|err| err.to_string())?;
-            if seconds > 0 {
-                items.push(UsageItem {
-                    name: month.format("%Y/%m").to_string(),
+            names.push(month.format("%Y/%m").to_string());
+            buckets.push((start, Self::date_range(next_month)?.0));
+            month = next_month;
+        }
+        let Some(window) = Self::bucket_window(&buckets) else {
+            return Ok(Vec::new());
+        };
+        let connection = self.connection.lock();
+        let sessions = Self::overlapping_sessions(&connection, window.0, window.1)?;
+        drop(connection);
+        Ok(Self::bucket_milliseconds(&sessions, &buckets)
+            .into_iter()
+            .zip(names)
+            .filter_map(|(milliseconds, name)| {
+                let seconds = milliseconds / 1000;
+                (seconds > 0).then_some(UsageItem {
+                    name,
                     seconds,
                     color: None,
                     executable: None,
                     process_path: None,
-                });
-            }
-            month = next_month;
-        }
-        Ok(items)
+                })
+            })
+            .collect())
     }
 
     fn grouped(
@@ -962,12 +1051,8 @@ mod tests {
     #[test]
     fn rule_for_does_not_duplicate_unchanged_rules() {
         let (_directory, store) = test_store();
-        store
-            .rule_for("test.exe", "Test", "C:\\test.exe")
-            .unwrap();
-        store
-            .rule_for("test.exe", "Test", "C:\\test.exe")
-            .unwrap();
+        store.rule_for("test.exe", "Test", "C:\\test.exe").unwrap();
+        store.rule_for("test.exe", "Test", "C:\\test.exe").unwrap();
         let count: i64 = store
             .connection
             .lock()
@@ -978,6 +1063,116 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn bucket_milliseconds_clips_sessions_to_each_bucket() {
+        let buckets = [(0, 100), (100, 200), (200, 300)];
+
+        assert_eq!(
+            Store::bucket_milliseconds(&[(50, 250)], &buckets),
+            [50, 100, 50]
+        );
+        assert_eq!(
+            Store::bucket_milliseconds(&[(0, 10), (290, 300)], &buckets),
+            [10, 0, 10]
+        );
+        assert_eq!(
+            Store::bucket_milliseconds(&[(300, 400), (-50, 0)], &buckets),
+            [0, 0, 0]
+        );
+    }
+
+    #[test]
+    fn bucketed_summaries_match_clipped_totals_across_boundaries() {
+        let (_directory, store) = test_store();
+        insert_session(
+            &store,
+            local_ms(2026, 6, 30, 23, 30, 0),
+            local_ms(2026, 7, 1, 0, 30, 0),
+        );
+        insert_session(
+            &store,
+            local_ms(2026, 7, 2, 8, 0, 0),
+            local_ms(2026, 7, 2, 9, 15, 0),
+        );
+
+        let range = store.range_summary("2026-06-30", "2026-07-02").unwrap();
+        assert_eq!(
+            range
+                .days
+                .iter()
+                .map(|item| (item.name.as_str(), item.seconds))
+                .collect::<Vec<_>>(),
+            [("06/30", 1_800), ("07/01", 1_800), ("07/02", 4_500)]
+        );
+
+        let months = store.all_summary().unwrap().months;
+        assert_eq!(
+            months
+                .iter()
+                .map(|item| (item.name.as_str(), item.seconds))
+                .collect::<Vec<_>>(),
+            [("2026/06", 1_800), ("2026/07", 6_300)]
+        );
+
+        let hours = store.day_summary("2026-07-02").unwrap().hours;
+        assert_eq!(
+            hours
+                .iter()
+                .map(|item| (item.name.as_str(), item.seconds))
+                .collect::<Vec<_>>(),
+            [("08:00", 3_600), ("09:00", 900)]
+        );
+    }
+
+    #[test]
+    fn rule_cache_serves_repeats_but_refreshes_after_updates() {
+        let (_directory, store) = test_store();
+        store.rule_for("test.exe", "Test", "C:\\test.exe").unwrap();
+        let category = store.create_category("影音", "#12ABEF").unwrap();
+
+        // A repeat call for the same path is served from the cache.
+        assert_eq!(
+            store
+                .rule_for("test.exe", "Test", "C:\\test.exe")
+                .unwrap()
+                .category,
+            "其他"
+        );
+
+        store
+            .update_rule(
+                "test.exe",
+                &AppRulePatch {
+                    display_name: Some("Custom".into()),
+                    category_id: Some(category.id),
+                    category_id_changed: true,
+                    ignored: Some(true),
+                    continue_tracking_while_idle: None,
+                },
+            )
+            .unwrap();
+        let refreshed = store.rule_for("test.exe", "Test", "C:\\test.exe").unwrap();
+        assert_eq!(refreshed.display_name, "Custom");
+        assert_eq!(refreshed.category, "影音");
+        assert!(refreshed.ignored);
+
+        store.delete_category(category.id).unwrap();
+        assert_eq!(
+            store
+                .rule_for("test.exe", "Test", "C:\\test.exe")
+                .unwrap()
+                .category,
+            "其他"
+        );
+
+        // A moved executable bypasses the cache so the stored path is refreshed.
+        let moved = store
+            .rule_for("test.exe", "Test", "D:\\moved\\test.exe")
+            .unwrap();
+        assert_eq!(moved.process_path, "D:\\moved\\test.exe");
+        assert_eq!(moved.display_name, "Custom");
     }
 
     #[test]

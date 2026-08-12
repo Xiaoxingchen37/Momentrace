@@ -117,6 +117,59 @@ const applyFontFamily = (value?: string | null) => {
 
 applyFontFamily(localStorage.getItem("momentrace.fontFamily"));
 
+type IconVisual = { source: string; background: string };
+const ICON_CACHE_LIMIT = 192;
+const ICON_CACHE_TTL_MS = 30 * 60 * 1000;
+type IconEntry = { visual: IconVisual; storedAt: number };
+const iconVisuals = new Map<string, IconEntry>();
+const iconRequests = new Map<string, Promise<IconVisual | undefined>>();
+
+const readIconVisual = (key: string) => {
+  const entry = iconVisuals.get(key);
+  if (!entry) return undefined;
+  if (Date.now() - entry.storedAt > ICON_CACHE_TTL_MS) {
+    iconVisuals.delete(key);
+    return undefined;
+  }
+  // Refresh recency so frequently shown icons survive eviction.
+  iconVisuals.delete(key);
+  iconVisuals.set(key, entry);
+  return entry.visual;
+};
+
+const rememberIconVisual = (key: string, visual: IconVisual) => {
+  if (iconVisuals.size >= ICON_CACHE_LIMIT) {
+    const oldest = iconVisuals.keys().next();
+    if (!oldest.done) iconVisuals.delete(oldest.value);
+  }
+  iconVisuals.set(key, { visual, storedAt: Date.now() });
+};
+
+const loadIconVisual = (
+  key: string,
+  path?: string | null,
+  executable?: string | null,
+) => {
+  const pending = iconRequests.get(key);
+  if (pending) return pending;
+
+  const request = invokeSafe<string>("get_app_icon", {
+    processPath: path,
+    executable,
+  })
+    .then(async (source) => {
+      const visual = { source, background: await getIconBackground(source) };
+      rememberIconVisual(key, visual);
+      return visual;
+    })
+    .catch(() => undefined)
+    .finally(() => {
+      iconRequests.delete(key);
+    });
+  iconRequests.set(key, request);
+  return request;
+};
+
 function AppIcon({
   name,
   path,
@@ -128,24 +181,22 @@ function AppIcon({
   executable?: string | null;
   size?: "small" | "normal" | "large";
 }) {
-  const [icon, setIcon] = useState<{ source: string; background: string }>();
+  const key = `${path ?? ""}\u0000${executable ?? ""}`;
+  const [icon, setIcon] = useState<IconVisual | undefined>(() =>
+    readIconVisual(key),
+  );
   useEffect(() => {
+    const cached = readIconVisual(key);
+    setIcon(cached);
+    if (cached || (!path && !executable)) return;
     let active = true;
-    setIcon(undefined);
-    if (!path && !executable) return;
-    invokeSafe<string>("get_app_icon", {
-      processPath: path,
-      executable,
-    })
-      .then(async (value) => {
-        const background = await getIconBackground(value);
-        if (active) setIcon({ source: value, background });
-      })
-      .catch(() => undefined);
+    void loadIconVisual(key, path, executable).then((visual) => {
+      if (active && visual) setIcon(visual);
+    });
     return () => {
       active = false;
     };
-  }, [path, executable]);
+  }, [key, path, executable]);
   return (
     <span
       className={`app-icon ${size}`}
@@ -179,6 +230,10 @@ function Dashboard() {
   const [rules, setRules] = useState<Rule[]>([]);
   const [settings, setSettings] = useState<Config>();
   const loadId = useRef(0);
+  const view = useRef({ page, date, rangeStart, rangeEnd });
+  useEffect(() => {
+    view.current = { page, date, rangeStart, rangeEnd };
+  });
   useEffect(() => {
     localStorage.setItem("momentrace.dashboard.page", page);
     localStorage.setItem("momentrace.dashboard.date", date);
@@ -231,23 +286,29 @@ function Dashboard() {
   };
   const refresh = async () => {
     const requestId = loadId.current;
+    const {
+      page: activePage,
+      date: activeDate,
+      rangeStart: activeStart,
+      rangeEnd: activeEnd,
+    } = view.current;
     try {
       const live = await invokeSafe<Status>("get_live_status");
       let nextDay: Day | undefined;
       let nextRange: Range | undefined;
       let nextAll: All | undefined;
-      if (page === "today") {
+      if (activePage === "today") {
         nextDay = await invokeSafe<Day>("get_day_summary", {
-          date: date || (await invokeSafe<string>("get_today")),
+          date: activeDate || (await invokeSafe<string>("get_today")),
         });
-      } else if (page === "range") {
+      } else if (activePage === "range") {
         const selectedEnd =
-          rangeEnd || date || (await invokeSafe<string>("get_today"));
+          activeEnd || activeDate || (await invokeSafe<string>("get_today"));
         nextRange = await invokeSafe<Range>("get_range_summary", {
-          startDate: rangeStart || shiftDate(selectedEnd, -6),
+          startDate: activeStart || shiftDate(selectedEnd, -6),
           endDate: selectedEnd,
         });
-      } else if (page === "all") {
+      } else if (activePage === "all") {
         nextAll = await invokeSafe<All>("get_all_summary");
       }
       if (requestId !== loadId.current) return;
@@ -277,7 +338,7 @@ function Dashboard() {
       void live.then((unlisten) => unlisten());
       void widget.then((unlisten) => unlisten());
     };
-  }, [page, date, rangeStart, rangeEnd]);
+  }, [date, rangeStart, rangeEnd]);
   const nav = [
     { id: "today", label: "今天", icon: Clock3 },
     { id: "range", label: "时间段", icon: CalendarRange },
@@ -447,7 +508,7 @@ function Dashboard() {
         </header>
         {page === "today" || page === "range" || page === "all" ? (
           <Overview
-            key={
+            viewKey={
               page === "today"
                 ? `day-${date}`
                 : page === "range"
@@ -500,15 +561,22 @@ function Dashboard() {
 }
 
 function Overview({
+  viewKey,
   data,
   period,
   current,
 }: {
+  viewKey: string;
   data?: Day | Range | All;
   period: "day" | "range" | "all";
   current?: AppInfo | null;
 }) {
   const [appPage, setAppPage] = useState(0);
+  const [pagedView, setPagedView] = useState(viewKey);
+  if (pagedView !== viewKey) {
+    setPagedView(viewKey);
+    setAppPage(0);
+  }
   const isRange = period === "range";
   const isAll = period === "all";
   const total =

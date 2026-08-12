@@ -1,8 +1,10 @@
 mod app_icon;
+mod icon_cache;
 mod store;
 mod tracker;
 
 use crate::{
+    icon_cache::{Cached, IconCache},
     store::{
         today, AllSummary, AppRule, AppRulePatch, Category, DaySummary, LiveStatus, RangeSummary,
         Settings, Store, WidgetStatus,
@@ -10,7 +12,6 @@ use crate::{
     tracker::Tracker,
 };
 use std::{
-    collections::HashMap,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -36,7 +37,7 @@ use windows61::Win32::{
 struct AppState {
     store: Arc<Store>,
     tracker: Arc<Tracker>,
-    icons: parking_lot::Mutex<HashMap<String, String>>,
+    icons: IconCache,
     widget_menu: parking_lot::Mutex<Option<MenuItem<tauri::Wry>>>,
     widget_geometry: parking_lot::Mutex<Option<(u32, i32, i32)>>,
     main_window_creating: AtomicBool,
@@ -46,8 +47,10 @@ struct AppState {
 fn get_live_status(state: State<AppState>) -> LiveStatus {
     state.tracker.status()
 }
+// Summary commands are async so their SQLite work runs on Tauri's worker pool
+// instead of blocking the window's event loop.
 #[tauri::command]
-fn get_day_summary(date: String, state: State<AppState>) -> Result<DaySummary, String> {
+async fn get_day_summary(date: String, state: State<'_, AppState>) -> Result<DaySummary, String> {
     state.store.day_summary(&date)
 }
 #[tauri::command]
@@ -55,15 +58,15 @@ fn get_widget_status(state: State<AppState>) -> Result<WidgetStatus, String> {
     state.tracker.widget_status()
 }
 #[tauri::command]
-fn get_range_summary(
+async fn get_range_summary(
     start_date: String,
     end_date: String,
-    state: State<AppState>,
+    state: State<'_, AppState>,
 ) -> Result<RangeSummary, String> {
     state.store.range_summary(&start_date, &end_date)
 }
 #[tauri::command]
-fn get_all_summary(state: State<AppState>) -> Result<AllSummary, String> {
+async fn get_all_summary(state: State<'_, AppState>) -> Result<AllSummary, String> {
     state.store.all_summary()
 }
 #[tauri::command]
@@ -79,7 +82,7 @@ fn delete_category(id: i64, state: State<AppState>) -> Result<(), String> {
     state.store.delete_category(id)
 }
 #[tauri::command]
-fn get_app_rules(state: State<AppState>) -> Result<Vec<AppRule>, String> {
+async fn get_app_rules(state: State<'_, AppState>) -> Result<Vec<AppRule>, String> {
     state.store.rules()
 }
 #[tauri::command]
@@ -124,15 +127,23 @@ fn get_today() -> String {
     today()
 }
 #[tauri::command]
-fn get_app_icon(
+async fn get_app_icon(
     process_path: Option<String>,
     executable: Option<String>,
-    state: State<AppState>,
+    state: State<'_, AppState>,
 ) -> Result<String, String> {
     let mut paths = process_path
         .filter(|path| !path.trim().is_empty())
         .into_iter()
         .collect::<Vec<_>>();
+    // A cached answer for the requested path avoids the session history lookup.
+    if let Some(path) = paths.first() {
+        match state.icons.get(path) {
+            Cached::Icon(icon) => return Ok(icon),
+            Cached::Unavailable => return Err("Windows did not provide an application icon".into()),
+            Cached::Missing => {}
+        }
+    }
     if let Some(executable) = executable.filter(|value| !value.trim().is_empty()) {
         for path in state.store.icon_paths(&executable)? {
             if !paths.iter().any(|value| value == &path) {
@@ -143,15 +154,20 @@ fn get_app_icon(
 
     let mut last_error = None;
     for path in paths {
-        if let Some(icon) = state.icons.lock().get(&path).cloned() {
-            return Ok(icon);
+        match state.icons.get(&path) {
+            Cached::Icon(icon) => return Ok(icon),
+            Cached::Unavailable => continue,
+            Cached::Missing => {}
         }
         match app_icon::from_executable(&path) {
             Ok(icon) => {
-                state.icons.lock().insert(path, icon.clone());
+                state.icons.insert(&path, Some(icon.clone()));
                 return Ok(icon);
             }
-            Err(error) => last_error = Some(error),
+            Err(error) => {
+                state.icons.insert(&path, None);
+                last_error = Some(error);
+            }
         }
     }
     Err(last_error.unwrap_or_else(|| "Application path is unavailable".into()))
@@ -452,7 +468,7 @@ pub fn run() {
             app.manage(AppState {
                 store,
                 tracker,
-                icons: parking_lot::Mutex::new(HashMap::new()),
+                icons: IconCache::default(),
                 widget_menu: parking_lot::Mutex::new(None),
                 widget_geometry: parking_lot::Mutex::new(None),
                 main_window_creating: AtomicBool::new(false),

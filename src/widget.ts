@@ -52,6 +52,7 @@ const elapsed = root.querySelector<HTMLElement>(".taskbar-overlay > strong")!;
 let iconRequestId = 0;
 let currentIconSource: string | null = null;
 let statusRevision = 0;
+let fontRevision = 0;
 
 const normalizeFontFamily = (value?: string | null): FontFamily =>
   value === "serif" || value === "sans" ? value : "classic";
@@ -106,7 +107,11 @@ const updateIcon = async (
     iconImage.hidden = false;
     iconFallback.hidden = true;
   } catch {
-    // The initial remains visible when an executable has no readable icon.
+    // A transient failure must not permanently poison this app's icon: reset
+    // the source so the next status update retries. The Rust side throttles
+    // repeated lookups for executables that genuinely have no icon.
+    currentIconSource = "";
+    showIconFallback(name);
   }
 };
 
@@ -126,6 +131,7 @@ const statusListener = listen<WidgetStatus>("widget-status", (event) => {
   render(event.payload);
 });
 const fontListener = listen<string>("font-family-changed", (event) => {
+  fontRevision += 1;
   applyFontFamily(event.payload);
 });
 
@@ -138,8 +144,11 @@ void invoke<WidgetStatus>("get_widget_status")
     if (initialRevision === statusRevision) render(status);
   })
   .catch(() => undefined);
+const initialFontRevision = fontRevision;
 void invoke<Settings>("get_settings")
-  .then((settings) => applyFontFamily(settings.fontFamily))
+  .then((settings) => {
+    if (initialFontRevision === fontRevision) applyFontFamily(settings.fontFamily);
+  })
   .catch(() => undefined);
 
 window.addEventListener("beforeunload", () => {

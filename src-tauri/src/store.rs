@@ -2,9 +2,21 @@ use chrono::{Datelike, Days, Local, NaiveDate, TimeZone, Utc};
 use parking_lot::Mutex;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
-use std::{fs, path::Path, sync::Arc};
+use std::{
+    fs,
+    path::Path,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+};
 
 const DATABASE_FILENAME: &str = "momentrace.sqlite3";
+
+/// Sessions recorded before an application was marked as ignored stay in the
+/// database so the rule can be undone, but no summary may count them. Every
+/// aggregate below filters on this, keyed on the `s` alias for the session row.
+const NOT_IGNORED: &str = "NOT EXISTS (SELECT 1 FROM app_rules ignore_rule WHERE ignore_rule.executable = s.executable AND ignore_rule.ignored = 1)";
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -57,9 +69,23 @@ pub struct DaySummary {
     pub hours: Vec<UsageItem>,
 }
 
+/// The first and last local dates that hold recorded usage. The dashboard uses
+/// these to bound its date pickers so a stray year cannot silently widen the
+/// selected window far beyond the data that exists.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordedBounds {
+    pub first_date: String,
+    pub last_date: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RangeSummary {
+    /// Recorded seconds inside the selected window, clipped once instead of
+    /// summing per-day values so the headline total cannot drift away from the
+    /// category and application breakdowns.
+    pub total_seconds: i64,
     pub days: Vec<UsageItem>,
     pub categories: Vec<UsageItem>,
     pub applications: Vec<UsageItem>,
@@ -67,6 +93,7 @@ pub struct RangeSummary {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AllSummary {
+    pub total_seconds: i64,
     pub months: Vec<UsageItem>,
     pub categories: Vec<UsageItem>,
     pub applications: Vec<UsageItem>,
@@ -117,10 +144,17 @@ pub struct Settings {
 
 pub struct Store {
     connection: Mutex<Connection>,
+    /// A dedicated read-only connection so summaries never contend with the
+    /// tracker's per-second writes on the primary connection. Kept separate so
+    /// long-running report queries cannot stall tracking.
+    read_connection: Mutex<Connection>,
     /// Caches the resolved rule per executable so the once-per-second tracker
     /// poll does not re-run three statements while the foreground app is stable.
     /// Invalidated whenever rules or categories change.
     rules_cache: Mutex<std::collections::HashMap<String, AppInfo>>,
+    /// Bumped on every invalidation; a loader that started before a change will
+    /// re-read when racing against a concurrent rule update.
+    rules_cache_generation: AtomicU64,
 }
 
 impl Store {
@@ -238,8 +272,19 @@ impl Store {
         }
         Ok(Arc::new(Self {
             connection: Mutex::new(connection),
+            read_connection: Mutex::new(Self::open_read_connection(data_dir)?),
             rules_cache: Mutex::new(std::collections::HashMap::new()),
+            rules_cache_generation: AtomicU64::new(0),
         }))
+    }
+
+    fn open_read_connection(data_dir: &Path) -> Result<Connection, String> {
+        let connection =
+            Connection::open(data_dir.join(DATABASE_FILENAME)).map_err(|err| err.to_string())?;
+        connection
+            .execute_batch("PRAGMA query_only = ON; PRAGMA busy_timeout = 5000;")
+            .map_err(|err| err.to_string())?;
+        Ok(connection)
     }
 
     pub fn rule_for(
@@ -253,10 +298,12 @@ impl Store {
                 return Ok(cached.clone());
             }
         }
+        let generation = self.rules_cache_generation.load(Ordering::Acquire);
         let info = self.load_rule(executable, display_name, process_path)?;
-        self.rules_cache
-            .lock()
-            .insert(executable.to_owned(), info.clone());
+        let mut cache = self.rules_cache.lock();
+        if self.rules_cache_generation.load(Ordering::Acquire) == generation {
+            cache.insert(executable.to_owned(), info.clone());
+        }
         Ok(info)
     }
 
@@ -302,6 +349,7 @@ impl Store {
 
     fn invalidate_rules_cache(&self) {
         self.rules_cache.lock().clear();
+        self.rules_cache_generation.fetch_add(1, Ordering::AcqRel);
     }
 
     pub fn append_session(
@@ -556,7 +604,10 @@ impl Store {
             )
             .map_err(|err| err.to_string())?;
         Ok(Settings {
-            idle_minutes: idle.parse().unwrap_or(5),
+            // Clamped on read as well as on write: a value outside the range
+            // would otherwise reach the tracker, and an idle limit of 0 pauses
+            // recording on every tick.
+            idle_minutes: idle.parse().unwrap_or(5).clamp(1, 120),
             launch_at_login: autostart == "true",
             show_widget: show_widget == "true",
             font_family: normalize_font_family(&font_family).into(),
@@ -567,31 +618,28 @@ impl Store {
     }
 
     pub fn update_settings(&self, settings: &Settings) -> Result<(), String> {
-        let connection = self.connection.lock();
-        connection
-            .execute(
-                "UPDATE settings SET value=?1 WHERE key='idle_minutes'",
-                params![settings.idle_minutes.clamp(1, 120).to_string()],
-            )
-            .map_err(|err| err.to_string())?;
-        connection
-            .execute(
-                "UPDATE settings SET value=?1 WHERE key='launch_at_login'",
-                params![settings.launch_at_login.to_string()],
-            )
-            .map_err(|err| err.to_string())?;
-        connection
-            .execute(
-                "UPDATE settings SET value=?1 WHERE key='show_widget'",
-                params![settings.show_widget.to_string()],
-            )
-            .map_err(|err| err.to_string())?;
-        connection
-            .execute(
-                "UPDATE settings SET value=?1 WHERE key='font_family'",
-                params![normalize_font_family(&settings.font_family)],
-            )
-            .map_err(|err| err.to_string())?;
+        let mut connection = self.connection.lock();
+        let tx = connection.transaction().map_err(|err| err.to_string())?;
+        tx.execute(
+            "UPDATE settings SET value=?1 WHERE key='idle_minutes'",
+            params![settings.idle_minutes.clamp(1, 120).to_string()],
+        )
+        .map_err(|err| err.to_string())?;
+        tx.execute(
+            "UPDATE settings SET value=?1 WHERE key='launch_at_login'",
+            params![settings.launch_at_login.to_string()],
+        )
+        .map_err(|err| err.to_string())?;
+        tx.execute(
+            "UPDATE settings SET value=?1 WHERE key='show_widget'",
+            params![settings.show_widget.to_string()],
+        )
+        .map_err(|err| err.to_string())?;
+        tx.execute(
+            "UPDATE settings SET value=?1 WHERE key='font_family'",
+            params![normalize_font_family(&settings.font_family)],
+        )
+        .map_err(|err| err.to_string())?;
         for (key, value) in [
             (
                 "widget_height",
@@ -606,14 +654,13 @@ impl Store {
                 settings.widget_y_offset.clamp(-1000, 1000).to_string(),
             ),
         ] {
-            connection
-                .execute(
-                    "UPDATE settings SET value=?1 WHERE key=?2",
-                    params![value, key],
-                )
-                .map_err(|err| err.to_string())?;
+            tx.execute(
+                "UPDATE settings SET value=?1 WHERE key=?2",
+                params![value, key],
+            )
+            .map_err(|err| err.to_string())?;
         }
-        Ok(())
+        tx.commit().map_err(|err| err.to_string())
     }
 
     fn range(date: &str) -> Result<(i64, i64), String> {
@@ -645,9 +692,9 @@ impl Store {
         end: i64,
     ) -> Result<Vec<(i64, i64)>, String> {
         let mut statement = connection
-            .prepare_cached(
-                "SELECT started_at, ended_at FROM sessions WHERE ended_at>?1 AND started_at<?2",
-            )
+            .prepare_cached(&format!(
+                "SELECT s.started_at, s.ended_at FROM sessions s WHERE s.ended_at>?1 AND s.started_at<?2 AND {NOT_IGNORED}"
+            ))
             .map_err(|err| err.to_string())?;
         let sessions = statement
             .query_map(params![start, end], |row| Ok((row.get(0)?, row.get(1)?)))
@@ -676,7 +723,7 @@ impl Store {
     }
 
     fn bucket_usage(
-        &self,
+        connection: &Connection,
         dates: impl IntoIterator<Item = NaiveDate>,
         label: &str,
     ) -> Result<Vec<UsageItem>, String> {
@@ -689,9 +736,7 @@ impl Store {
         let Some(window) = Self::bucket_window(&buckets) else {
             return Ok(Vec::new());
         };
-        let connection = self.connection.lock();
-        let sessions = Self::overlapping_sessions(&connection, window.0, window.1)?;
-        drop(connection);
+        let sessions = Self::overlapping_sessions(connection, window.0, window.1)?;
         Ok(Self::bucket_milliseconds(&sessions, &buckets)
             .into_iter()
             .zip(names)
@@ -714,7 +759,7 @@ impl Store {
         Some((start, end))
     }
 
-    fn hour_usage(&self, date: NaiveDate) -> Result<Vec<UsageItem>, String> {
+    fn hour_usage(connection: &Connection, date: NaiveDate) -> Result<Vec<UsageItem>, String> {
         let (day_start, day_end) = Self::date_range(date)?;
         let mut buckets = Vec::new();
         let mut start = day_start;
@@ -723,46 +768,35 @@ impl Store {
             buckets.push((start, end));
             start = end;
         }
-        let connection = self.connection.lock();
-        let sessions = Self::overlapping_sessions(&connection, day_start, day_end)?;
-        drop(connection);
+        let sessions = Self::overlapping_sessions(connection, day_start, day_end)?;
         let totals = Self::bucket_milliseconds(&sessions, &buckets);
-        let mut by_hour = std::collections::BTreeMap::<String, i64>::new();
+        let mut items = Vec::with_capacity(buckets.len());
         for (&(start, _), milliseconds) in buckets.iter().zip(totals) {
-            let seconds = milliseconds / 1000;
-            if seconds <= 0 {
-                continue;
-            }
             let name = Local
                 .timestamp_millis_opt(start)
                 .single()
                 .ok_or("Unable to determine local hour")?
                 .format("%H:00")
                 .to_string();
-            *by_hour.entry(name).or_default() += seconds;
-        }
-        Ok(by_hour
-            .into_iter()
-            .map(|(name, seconds)| UsageItem {
+            items.push(UsageItem {
                 name,
-                seconds,
+                seconds: milliseconds / 1000,
                 color: None,
                 executable: None,
                 process_path: None,
-            })
-            .collect())
+            });
+        }
+        Ok(items)
     }
 
-    fn all_month_usage(&self) -> Result<Vec<UsageItem>, String> {
-        let connection = self.connection.lock();
+    fn all_month_usage(connection: &Connection) -> Result<Vec<UsageItem>, String> {
         let (first, last): (Option<i64>, Option<i64>) = connection
             .query_row(
-                "SELECT MIN(started_at), MAX(ended_at) FROM sessions",
+                &format!("SELECT MIN(s.started_at), MAX(s.ended_at) FROM sessions s WHERE {NOT_IGNORED}"),
                 [],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .map_err(|err| err.to_string())?;
-        drop(connection);
         let (Some(first), Some(last)) = (first, last) else {
             return Ok(Vec::new());
         };
@@ -793,9 +827,7 @@ impl Store {
         let Some(window) = Self::bucket_window(&buckets) else {
             return Ok(Vec::new());
         };
-        let connection = self.connection.lock();
-        let sessions = Self::overlapping_sessions(&connection, window.0, window.1)?;
-        drop(connection);
+        let sessions = Self::overlapping_sessions(connection, window.0, window.1)?;
         Ok(Self::bucket_milliseconds(&sessions, &buckets)
             .into_iter()
             .zip(names)
@@ -813,11 +845,10 @@ impl Store {
     }
 
     fn grouped(
-        &self,
+        connection: &Connection,
         sql: &str,
         values: &[&dyn rusqlite::ToSql],
     ) -> Result<Vec<UsageItem>, String> {
-        let connection = self.connection.lock();
         let mut statement = connection.prepare(sql).map_err(|err| err.to_string())?;
         let items = statement
             .query_map(values, |row| {
@@ -836,11 +867,10 @@ impl Store {
     }
 
     fn application_usage(
-        &self,
+        connection: &Connection,
         sql: &str,
         values: &[&dyn rusqlite::ToSql],
     ) -> Result<Vec<UsageItem>, String> {
-        let connection = self.connection.lock();
         let mut statement = connection.prepare(sql).map_err(|err| err.to_string())?;
         let items = statement
             .query_map(values, |row| {
@@ -864,7 +894,7 @@ impl Store {
 
     pub fn today_app_seconds(&self, executable: &str) -> Result<i64, String> {
         let (start, end) = Self::range(&today())?;
-        self.connection.lock().query_row(
+        self.read_connection.lock().query_row(
             "SELECT COALESCE(SUM(MAX(0, MIN(ended_at, ?3) - MAX(started_at, ?2))) / 1000, 0) FROM sessions WHERE executable=?1 AND ended_at>?2 AND started_at<?3",
             params![executable, start, end],
             |row| row.get(0),
@@ -872,12 +902,15 @@ impl Store {
     }
     pub fn day_summary(&self, date: &str) -> Result<DaySummary, String> {
         let (start, end) = Self::range(date)?;
-        let total: i64 = self.connection.lock().query_row("SELECT COALESCE(SUM(MAX(0, MIN(ended_at, ?2) - MAX(started_at, ?1))) / 1000, 0) FROM sessions WHERE ended_at>?1 AND started_at<?2", params![start, end], |row| row.get(0)).map_err(|err| err.to_string())?;
-        let categories = self.grouped("SELECT COALESCE(c.name, '其他'), COALESCE(SUM(MAX(0, MIN(s.ended_at, ?2) - MAX(s.started_at, ?1))) / 1000,0), COALESCE(c.color, '#8391A5') FROM sessions s LEFT JOIN app_rules r ON r.executable=s.executable LEFT JOIN categories c ON c.id=r.category_id WHERE s.ended_at>?1 AND s.started_at<?2 GROUP BY c.name, c.color ORDER BY 2 DESC, 1 COLLATE NOCASE", &[&start, &end])?;
-        let applications = self.application_usage("SELECT COALESCE(r.display_name, s.display_name), COALESCE(SUM(MAX(0, MIN(s.ended_at, ?2) - MAX(s.started_at, ?1))) / 1000,0), s.executable, COALESCE(r.process_path, MAX(s.process_path)) FROM sessions s LEFT JOIN app_rules r ON r.executable=s.executable WHERE s.ended_at>?1 AND s.started_at<?2 GROUP BY s.executable, r.display_name ORDER BY 2 DESC, 1 COLLATE NOCASE, s.executable COLLATE NOCASE", &[&start, &end])?;
+        let mut connection = self.read_connection.lock();
+        let tx = connection.transaction().map_err(|err| err.to_string())?;
+        let total: i64 = tx.query_row(&format!("SELECT COALESCE(SUM(MAX(0, MIN(s.ended_at, ?2) - MAX(s.started_at, ?1))) / 1000, 0) FROM sessions s WHERE s.ended_at>?1 AND s.started_at<?2 AND {NOT_IGNORED}"), params![start, end], |row| row.get(0)).map_err(|err| err.to_string())?;
+        let categories = Self::grouped(&tx, &format!("SELECT COALESCE(c.name, '其他'), COALESCE(SUM(MAX(0, MIN(s.ended_at, ?2) - MAX(s.started_at, ?1))) / 1000,0), COALESCE(c.color, '#8391A5') FROM sessions s LEFT JOIN app_rules r ON r.executable=s.executable LEFT JOIN categories c ON c.id=r.category_id WHERE s.ended_at>?1 AND s.started_at<?2 AND {NOT_IGNORED} GROUP BY c.name, c.color ORDER BY 2 DESC, 1 COLLATE NOCASE"), &[&start, &end])?;
+        let applications = Self::application_usage(&tx, &format!("SELECT COALESCE(r.display_name, s.display_name), COALESCE(SUM(MAX(0, MIN(s.ended_at, ?2) - MAX(s.started_at, ?1))) / 1000,0), s.executable, COALESCE(r.process_path, MAX(s.process_path)) FROM sessions s LEFT JOIN app_rules r ON r.executable=s.executable WHERE s.ended_at>?1 AND s.started_at<?2 AND {NOT_IGNORED} GROUP BY s.executable, r.display_name ORDER BY 2 DESC, 1 COLLATE NOCASE, s.executable COLLATE NOCASE"), &[&start, &end])?;
         let parsed_date =
             NaiveDate::parse_from_str(date, "%Y-%m-%d").map_err(|err| err.to_string())?;
-        let hours = self.hour_usage(parsed_date)?;
+        let hours = Self::hour_usage(&tx, parsed_date)?;
+        tx.commit().map_err(|err| err.to_string())?;
         Ok(DaySummary {
             date: date.into(),
             total_seconds: total,
@@ -909,25 +942,63 @@ impl Store {
         } else {
             "%Y/%m/%d"
         };
-        let days = self.bucket_usage(
+        let mut connection = self.read_connection.lock();
+        let tx = connection.transaction().map_err(|err| err.to_string())?;
+        let total: i64 = tx.query_row(&format!("SELECT COALESCE(SUM(MAX(0, MIN(s.ended_at, ?2) - MAX(s.started_at, ?1))) / 1000, 0) FROM sessions s WHERE s.ended_at>?1 AND s.started_at<?2 AND {NOT_IGNORED}"), params![start, end], |row| row.get(0)).map_err(|err| err.to_string())?;
+        let days = Self::bucket_usage(
+            &tx,
             std::iter::successors(Some(first), |day| day.checked_add_days(Days::new(1)))
                 .take_while(|day| *day <= last),
             label,
         )?;
-        let categories = self.grouped("SELECT COALESCE(c.name, '其他'), SUM(MAX(0, MIN(s.ended_at, ?2) - MAX(s.started_at, ?1))) / 1000, COALESCE(c.color, '#8391A5') FROM sessions s LEFT JOIN app_rules r ON r.executable=s.executable LEFT JOIN categories c ON c.id=r.category_id WHERE s.ended_at>?1 AND s.started_at<?2 GROUP BY c.name,c.color ORDER BY 2 DESC, 1 COLLATE NOCASE", &[&start, &end])?;
-        let applications = self.application_usage("SELECT COALESCE(r.display_name, s.display_name), SUM(MAX(0, MIN(s.ended_at, ?2) - MAX(s.started_at, ?1))) / 1000, s.executable, COALESCE(r.process_path, MAX(s.process_path)) FROM sessions s LEFT JOIN app_rules r ON r.executable=s.executable WHERE s.ended_at>?1 AND s.started_at<?2 GROUP BY s.executable, r.display_name ORDER BY 2 DESC, 1 COLLATE NOCASE, s.executable COLLATE NOCASE", &[&start, &end])?;
+        let categories = Self::grouped(&tx, &format!("SELECT COALESCE(c.name, '其他'), SUM(MAX(0, MIN(s.ended_at, ?2) - MAX(s.started_at, ?1))) / 1000, COALESCE(c.color, '#8391A5') FROM sessions s LEFT JOIN app_rules r ON r.executable=s.executable LEFT JOIN categories c ON c.id=r.category_id WHERE s.ended_at>?1 AND s.started_at<?2 AND {NOT_IGNORED} GROUP BY c.name,c.color ORDER BY 2 DESC, 1 COLLATE NOCASE"), &[&start, &end])?;
+        let applications = Self::application_usage(&tx, &format!("SELECT COALESCE(r.display_name, s.display_name), SUM(MAX(0, MIN(s.ended_at, ?2) - MAX(s.started_at, ?1))) / 1000, s.executable, COALESCE(r.process_path, MAX(s.process_path)) FROM sessions s LEFT JOIN app_rules r ON r.executable=s.executable WHERE s.ended_at>?1 AND s.started_at<?2 AND {NOT_IGNORED} GROUP BY s.executable, r.display_name ORDER BY 2 DESC, 1 COLLATE NOCASE, s.executable COLLATE NOCASE"), &[&start, &end])?;
+        tx.commit().map_err(|err| err.to_string())?;
         Ok(RangeSummary {
+            total_seconds: total,
             days,
             categories,
             applications,
         })
     }
 
+    /// The local dates of the earliest and latest recorded usage, or None when
+    /// nothing has been recorded yet.
+    pub fn recorded_bounds(&self) -> Result<Option<RecordedBounds>, String> {
+        let (first, last): (Option<i64>, Option<i64>) = self
+            .read_connection
+            .lock()
+            .query_row(
+                &format!("SELECT MIN(s.started_at), MAX(s.ended_at) FROM sessions s WHERE {NOT_IGNORED}"),
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(|err| err.to_string())?;
+        let (Some(first), Some(last)) = (first, last) else {
+            return Ok(None);
+        };
+        Ok(Some(RecordedBounds {
+            first_date: local_date(first)?,
+            last_date: local_date(last)?,
+        }))
+    }
+
     pub fn all_summary(&self) -> Result<AllSummary, String> {
-        let months = self.all_month_usage()?;
-        let categories = self.grouped("SELECT COALESCE(c.name, '其他'), SUM(s.ended_at-s.started_at)/1000, COALESCE(c.color, '#8391A5') FROM sessions s LEFT JOIN app_rules r ON r.executable=s.executable LEFT JOIN categories c ON c.id=r.category_id GROUP BY c.name,c.color ORDER BY 2 DESC, 1 COLLATE NOCASE", &[])?;
-        let applications = self.application_usage("SELECT COALESCE(r.display_name, s.display_name), SUM(s.ended_at-s.started_at)/1000, s.executable, COALESCE(r.process_path, MAX(s.process_path)) FROM sessions s LEFT JOIN app_rules r ON r.executable=s.executable GROUP BY s.executable, r.display_name ORDER BY 2 DESC, 1 COLLATE NOCASE, s.executable COLLATE NOCASE", &[])?;
+        let mut connection = self.read_connection.lock();
+        let tx = connection.transaction().map_err(|err| err.to_string())?;
+        let total: i64 = tx
+            .query_row(
+                &format!("SELECT COALESCE(SUM(s.ended_at - s.started_at) / 1000, 0) FROM sessions s WHERE {NOT_IGNORED}"),
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|err| err.to_string())?;
+        let months = Self::all_month_usage(&tx)?;
+        let categories = Self::grouped(&tx, &format!("SELECT COALESCE(c.name, '其他'), SUM(s.ended_at-s.started_at)/1000, COALESCE(c.color, '#8391A5') FROM sessions s LEFT JOIN app_rules r ON r.executable=s.executable LEFT JOIN categories c ON c.id=r.category_id WHERE {NOT_IGNORED} GROUP BY c.name,c.color ORDER BY 2 DESC, 1 COLLATE NOCASE"), &[])?;
+        let applications = Self::application_usage(&tx, &format!("SELECT COALESCE(r.display_name, s.display_name), SUM(s.ended_at-s.started_at)/1000, s.executable, COALESCE(r.process_path, MAX(s.process_path)) FROM sessions s LEFT JOIN app_rules r ON r.executable=s.executable WHERE {NOT_IGNORED} GROUP BY s.executable, r.display_name ORDER BY 2 DESC, 1 COLLATE NOCASE, s.executable COLLATE NOCASE"), &[])?;
+        tx.commit().map_err(|err| err.to_string())?;
         Ok(AllSummary {
+            total_seconds: total,
             months,
             categories,
             applications,
@@ -935,16 +1006,34 @@ impl Store {
     }
 
     pub fn clear(&self) -> Result<(), String> {
-        self.connection
-            .lock()
-            .execute("DELETE FROM sessions", [])
-            .map(|_| ())
-            .map_err(|err| err.to_string())
+        let connection = self.connection.lock();
+        // secure_delete zeroes freed pages so erased timestamps and paths are
+        // not recoverable from the database file. Deleting app_rules also
+        // removes recorded application names and full executable paths.
+        connection
+            .execute_batch(
+                "PRAGMA secure_delete = ON;
+                 DELETE FROM sessions;
+                 DELETE FROM app_rules;",
+            )
+            .map_err(|err| err.to_string())?;
+        drop(connection);
+        self.invalidate_rules_cache();
+        Ok(())
     }
 }
 
 pub fn now_ms() -> i64 {
     Utc::now().timestamp_millis()
+}
+/// Formats a millisecond timestamp as the local calendar date it belongs to, so
+/// bounds line up with the day buckets used by the summaries.
+fn local_date(milliseconds: i64) -> Result<String, String> {
+    Local
+        .timestamp_millis_opt(milliseconds)
+        .single()
+        .ok_or_else(|| "Unable to determine local date".to_string())
+        .map(|value| value.format("%Y-%m-%d").to_string())
 }
 pub fn today() -> String {
     Local::now().format("%Y-%m-%d").to_string()
@@ -1012,6 +1101,47 @@ mod tests {
         ).unwrap();
     }
 
+    fn insert_named_session(
+        store: &Store,
+        executable: &str,
+        display_name: &str,
+        started_at: i64,
+        ended_at: i64,
+    ) {
+        store
+            .connection
+            .lock()
+            .execute(
+                "INSERT INTO sessions(executable, display_name, process_path, started_at, ended_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    executable,
+                    display_name,
+                    format!("C:\\{executable}"),
+                    started_at,
+                    ended_at
+                ],
+            )
+            .unwrap();
+    }
+
+    fn mark_ignored(store: &Store, executable: &str, display_name: &str) {
+        store
+            .rule_for(executable, display_name, &format!("C:\\{executable}"))
+            .unwrap();
+        store
+            .update_rule(
+                executable,
+                &AppRulePatch {
+                    display_name: None,
+                    category_id: None,
+                    category_id_changed: false,
+                    ignored: Some(true),
+                    continue_tracking_while_idle: None,
+                },
+            )
+            .unwrap();
+    }
+
     fn insert_app_session(store: &Store, index: usize, started_at: i64, ended_at: i64) {
         let executable = format!("app-{index}.exe");
         let display_name = format!("App {index}");
@@ -1066,6 +1196,58 @@ mod tests {
     }
 
     #[test]
+    fn clear_removes_sessions_and_rules_but_keeps_preferences() {
+        let (_directory, store) = test_store();
+        insert_session(
+            &store,
+            local_ms(2026, 7, 13, 10, 0, 0),
+            local_ms(2026, 7, 13, 10, 5, 0),
+        );
+        store.rule_for("test.exe", "Test", "C:\\test.exe").unwrap();
+
+        store.clear().unwrap();
+
+        let session_count: i64 = store
+            .connection
+            .lock()
+            .query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0))
+            .unwrap();
+        let rule_count: i64 = store
+            .connection
+            .lock()
+            .query_row("SELECT COUNT(*) FROM app_rules", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(session_count, 0);
+        assert_eq!(rule_count, 0);
+
+        // Preferences are user choices, not usage records, and must survive.
+        assert_eq!(store.settings().unwrap().idle_minutes, 5);
+        assert!(!store.categories().unwrap().is_empty());
+    }
+
+    #[test]
+    fn clock_jump_reanchors_session_session_start() {
+        // Regression for backward clock steps: calling append_session with a
+        // reversed interval must be a no-op rather than corrupt data.
+        let (_directory, store) = test_store();
+        let app = AppInfo {
+            executable: "test.exe".into(),
+            display_name: "Test".into(),
+            process_path: "C:\\test.exe".into(),
+            category: "其他".into(),
+            ignored: false,
+            continue_tracking_while_idle: false,
+        };
+        store.append_session(&app, 5_000, 2_000).unwrap();
+        let count: i64 = store
+            .connection
+            .lock()
+            .query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
     fn bucket_milliseconds_clips_sessions_to_each_bucket() {
         let buckets = [(0, 100), (100, 200), (200, 300)];
 
@@ -1117,9 +1299,11 @@ mod tests {
         );
 
         let hours = store.day_summary("2026-07-02").unwrap().hours;
+        assert_eq!(hours.len(), 24);
         assert_eq!(
             hours
                 .iter()
+                .filter(|item| item.seconds > 0)
                 .map(|item| (item.name.as_str(), item.seconds))
                 .collect::<Vec<_>>(),
             [("08:00", 3_600), ("09:00", 900)]
@@ -1205,10 +1389,12 @@ mod tests {
         let summary = store.day_summary("2026-07-13").unwrap();
 
         assert_eq!(summary.total_seconds, 120);
+        assert_eq!(summary.hours.len(), 24);
         assert_eq!(
             summary
                 .hours
                 .iter()
+                .filter(|item| item.seconds > 0)
                 .map(|item| (item.name.as_str(), item.seconds))
                 .collect::<Vec<_>>(),
             [("10:00", 60), ("11:00", 60)]
@@ -1259,6 +1445,211 @@ mod tests {
             [("2026/06", 30), ("2026/07", 30)]
         );
         assert_eq!(summary.applications[0].seconds, 60);
+    }
+
+    #[test]
+    fn summaries_exclude_applications_marked_as_ignored() {
+        let (_directory, store) = test_store();
+        let kept = local_ms(2026, 7, 13, 9, 0, 0);
+        let hidden = local_ms(2026, 7, 13, 14, 0, 0);
+        insert_named_session(&store, "keep.exe", "Keep", kept, kept + 600_000);
+        insert_named_session(&store, "hide.exe", "Hide", hidden, hidden + 300_000);
+        mark_ignored(&store, "hide.exe", "Hide");
+
+        let day = store.day_summary("2026-07-13").unwrap();
+        assert_eq!(day.total_seconds, 600);
+        assert_eq!(
+            day.applications
+                .iter()
+                .map(|item| item.name.as_str())
+                .collect::<Vec<_>>(),
+            ["Keep"]
+        );
+        assert_eq!(
+            day.categories.iter().map(|item| item.seconds).sum::<i64>(),
+            600
+        );
+        // The hourly chart is bucketed separately and must agree.
+        assert_eq!(day.hours.iter().map(|item| item.seconds).sum::<i64>(), 600);
+        assert!(day.hours.iter().all(|item| item.name != "14:00" || item.seconds == 0));
+
+        let range = store.range_summary("2026-07-13", "2026-07-13").unwrap();
+        assert_eq!(range.total_seconds, 600);
+        assert_eq!(range.days.iter().map(|item| item.seconds).sum::<i64>(), 600);
+        assert_eq!(range.applications.len(), 1);
+        assert_eq!(
+            range
+                .categories
+                .iter()
+                .map(|item| item.seconds)
+                .sum::<i64>(),
+            600
+        );
+
+        let all = store.all_summary().unwrap();
+        assert_eq!(all.total_seconds, 600);
+        assert_eq!(all.months.iter().map(|item| item.seconds).sum::<i64>(), 600);
+        assert_eq!(all.applications.len(), 1);
+        assert_eq!(
+            all.categories.iter().map(|item| item.seconds).sum::<i64>(),
+            600
+        );
+    }
+
+    #[test]
+    fn clearing_the_ignore_flag_brings_the_history_back() {
+        let (_directory, store) = test_store();
+        let start = local_ms(2026, 7, 13, 9, 0, 0);
+        insert_named_session(&store, "hide.exe", "Hide", start, start + 300_000);
+        mark_ignored(&store, "hide.exe", "Hide");
+        assert_eq!(store.day_summary("2026-07-13").unwrap().total_seconds, 0);
+
+        store
+            .update_rule(
+                "hide.exe",
+                &AppRulePatch {
+                    display_name: None,
+                    category_id: None,
+                    category_id_changed: false,
+                    ignored: Some(false),
+                    continue_tracking_while_idle: None,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(store.day_summary("2026-07-13").unwrap().total_seconds, 300);
+    }
+
+    #[test]
+    fn recorded_bounds_skip_ignored_applications() {
+        let (_directory, store) = test_store();
+        let ignored = local_ms(2026, 7, 12, 10, 0, 0);
+        let visible = local_ms(2026, 7, 20, 10, 0, 0);
+        insert_named_session(&store, "hide.exe", "Hide", ignored, ignored + 60_000);
+        insert_named_session(&store, "keep.exe", "Keep", visible, visible + 60_000);
+        mark_ignored(&store, "hide.exe", "Hide");
+
+        let bounds = store.recorded_bounds().unwrap().unwrap();
+        assert_eq!(bounds.first_date, "2026-07-20");
+        assert_eq!(bounds.last_date, "2026-07-20");
+    }
+
+    #[test]
+    fn range_total_matches_breakdowns_and_ignores_days_outside_the_window() {
+        let (_directory, store) = test_store();
+        // Two days of usage plus a session that must stay out of the window.
+        insert_session(
+            &store,
+            local_ms(2026, 7, 13, 9, 0, 0),
+            local_ms(2026, 7, 13, 9, 30, 30),
+        );
+        insert_session(
+            &store,
+            local_ms(2026, 7, 14, 22, 0, 0),
+            local_ms(2026, 7, 14, 22, 10, 30),
+        );
+        insert_session(
+            &store,
+            local_ms(2026, 7, 20, 10, 0, 0),
+            local_ms(2026, 7, 20, 11, 0, 0),
+        );
+
+        let summary = store.range_summary("2026-07-13", "2026-07-14").unwrap();
+
+        // The headline total is the clipped window sum, not a sum of per-day
+        // values that each lose their sub-second remainder.
+        assert_eq!(summary.total_seconds, 1_830 + 630);
+        assert_eq!(
+            summary.days.iter().map(|item| item.seconds).sum::<i64>(),
+            1_830 + 630
+        );
+        assert_eq!(
+            summary
+                .categories
+                .iter()
+                .map(|item| item.seconds)
+                .sum::<i64>(),
+            summary.total_seconds
+        );
+        assert_eq!(
+            summary
+                .applications
+                .iter()
+                .map(|item| item.seconds)
+                .sum::<i64>(),
+            summary.total_seconds
+        );
+    }
+
+    #[test]
+    fn range_total_does_not_drift_when_days_have_sub_second_remainders() {
+        let (_directory, store) = test_store();
+        // 1.5s on each of two days: per-day flooring would report 2s total.
+        for day in [13, 14] {
+            let start = local_ms(2026, 7, day, 8, 0, 0);
+            store
+                .connection
+                .lock()
+                .execute(
+                    "INSERT INTO sessions(executable, display_name, process_path, started_at, ended_at) VALUES ('test.exe', 'Test', 'C:\\test.exe', ?1, ?2)",
+                    params![start, start + 1_500],
+                )
+                .unwrap();
+        }
+
+        let summary = store.range_summary("2026-07-13", "2026-07-14").unwrap();
+
+        assert_eq!(summary.days.iter().map(|item| item.seconds).sum::<i64>(), 2);
+        assert_eq!(summary.total_seconds, 3);
+        assert_eq!(summary.applications[0].seconds, 3);
+    }
+
+    #[test]
+    fn all_summary_reports_total_matching_its_breakdowns() {
+        let (_directory, store) = test_store();
+        insert_session(
+            &store,
+            local_ms(2026, 6, 30, 23, 59, 30),
+            local_ms(2026, 7, 1, 0, 0, 30),
+        );
+        insert_session(
+            &store,
+            local_ms(2026, 7, 5, 10, 0, 0),
+            local_ms(2026, 7, 5, 10, 5, 0),
+        );
+
+        let summary = store.all_summary().unwrap();
+
+        assert_eq!(summary.total_seconds, 60 + 300);
+        assert_eq!(
+            summary
+                .applications
+                .iter()
+                .map(|item| item.seconds)
+                .sum::<i64>(),
+            summary.total_seconds
+        );
+    }
+
+    #[test]
+    fn recorded_bounds_report_the_local_dates_that_hold_usage() {
+        let (_directory, store) = test_store();
+        assert!(store.recorded_bounds().unwrap().is_none());
+
+        insert_session(
+            &store,
+            local_ms(2026, 7, 12, 23, 59, 0),
+            local_ms(2026, 7, 13, 0, 1, 0),
+        );
+        insert_session(
+            &store,
+            local_ms(2026, 7, 20, 8, 0, 0),
+            local_ms(2026, 7, 20, 9, 0, 0),
+        );
+
+        let bounds = store.recorded_bounds().unwrap().unwrap();
+        assert_eq!(bounds.first_date, "2026-07-12");
+        assert_eq!(bounds.last_date, "2026-07-20");
     }
 
     #[test]

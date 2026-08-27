@@ -5,6 +5,11 @@ use std::{collections::HashMap, fs, path::Path, time::UNIX_EPOCH};
 /// no view shows more than a few dozen applications at a time.
 const CAPACITY: usize = 192;
 
+/// Failed extraction is remembered for a short while so a flaky Win32 call does
+/// not trigger repeated work every request, but the entry then re-arms so a
+/// temporary failure (e.g. a locked file) recovers on its own.
+const NEGATIVE_CACHE_TICKS: u64 = 120;
+
 /// Identifies the exact file an icon was extracted from, so a reinstall that
 /// changes the executable invalidates the entry instead of serving a stale icon.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,6 +39,8 @@ struct Entry {
     /// for executables that genuinely have no readable icon.
     icon: Option<String>,
     used_at: u64,
+    /// When the negative entry re-arms and should be retried.
+    unavailable_until: Option<u64>,
 }
 
 #[derive(Default)]
@@ -66,6 +73,12 @@ impl IconCache {
             inner.entries.remove(path);
             return Cached::Missing;
         }
+        if let Some(until) = entry.unavailable_until {
+            if clock >= until {
+                inner.entries.remove(path);
+                return Cached::Missing;
+            }
+        }
         entry.used_at = clock;
         match entry.icon.as_ref() {
             Some(icon) => Cached::Icon(icon.clone()),
@@ -77,13 +90,20 @@ impl IconCache {
         let fingerprint = Fingerprint::read(path);
         let mut inner = self.inner.lock();
         inner.clock += 1;
-        let used_at = inner.clock;
+        let clock = inner.clock;
+        let used_at = clock;
+        let unavailable_until = if icon.is_none() {
+            Some(clock + NEGATIVE_CACHE_TICKS)
+        } else {
+            None
+        };
         inner.entries.insert(
             path.to_owned(),
             Entry {
                 fingerprint,
                 icon,
                 used_at,
+                unavailable_until,
             },
         );
         while inner.entries.len() > CAPACITY {
@@ -132,6 +152,24 @@ mod tests {
 
         cache.insert(&key, None);
         assert!(matches!(cache.get(&key), Cached::Unavailable));
+    }
+
+    #[test]
+    fn negative_cache_rearms_after_its_window() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("app.exe");
+        write_file(&path, b"first");
+        let key = path.to_string_lossy().to_string();
+        let cache = IconCache::default();
+
+        cache.insert(&key, None);
+        assert!(matches!(cache.get(&key), Cached::Unavailable));
+
+        // Advancing the clock past the negative window re-arms the entry.
+        let mut inner = cache.inner.lock();
+        inner.clock += NEGATIVE_CACHE_TICKS + 1;
+        drop(inner);
+        assert!(matches!(cache.get(&key), Cached::Missing));
     }
 
     #[test]

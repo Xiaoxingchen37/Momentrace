@@ -31,6 +31,7 @@ struct Session {
     started_at: i64,
     last_checkpoint_at: i64,
     last_seen_at: i64,
+    last_seen_mono: Option<Instant>,
     last_tick: Option<Instant>,
     pending_end_at: Option<i64>,
     paused: bool,
@@ -146,7 +147,33 @@ impl Tracker {
             }
             session.paused = true;
         }
+        // Wall-clock changes (manual time steps, time-service jumps) distort
+        // durations far beyond what monotonic time can explain. When the clock
+        // jumps forward the extra duration is not real usage; when it jumps
+        // backward the computed end would be future-dated. Either way the
+        // current segment is ended and re-anchored at the corrected instant.
+        if session.app.is_some() && session.last_seen_mono.is_some() {
+            let last_mono = session.last_seen_mono.unwrap();
+            let mono_elapsed_ms = tick_at.duration_since(last_mono).as_millis() as i128;
+            let wall_elapsed_ms = now as i128 - session.last_seen_at as i128;
+            if wall_clock_jumped(wall_elapsed_ms, mono_elapsed_ms) {
+                let estimated_end = session
+                    .last_seen_at
+                    .saturating_add(mono_elapsed_ms.max(1_000) as i64);
+                let end = estimated_end.max(session.started_at).min(now);
+                if !self.finish_at(&mut session, end) {
+                    return;
+                }
+                session.last_seen_at = now;
+                session.last_seen_mono = Some(tick_at);
+                session.started_at = now;
+                session.last_checkpoint_at = now;
+                session.paused = false;
+                return;
+            }
+        }
         session.last_seen_at = now;
+        session.last_seen_mono = Some(tick_at);
         if session.manual_pause {
             if !session.paused {
                 self.finish_at(&mut session, now);
@@ -202,15 +229,18 @@ impl Tracker {
                         .as_ref()
                         .is_some_and(|app| app.continue_tracking_while_idle),
                 );
-                self.finish_at(&mut session, active_until);
+                if !self.finish_at(&mut session, active_until) {
+                    return;
+                }
                 session.paused = true;
             }
             return;
         }
-        if !session.paused
-            && session.app.as_ref().map(|app| app.executable.as_str())
-                == Some(current.executable.as_str())
-        {
+        let same_app = session.app.as_ref().is_some_and(|app| {
+            app.executable.as_str() == current.executable.as_str()
+                && app.process_path.as_str() == current.process_path.as_str()
+        });
+        if same_app && !session.paused {
             if session
                 .app
                 .as_ref()
@@ -228,18 +258,16 @@ impl Tracker {
             self.checkpoint(&mut session);
             return;
         }
-        if session.paused
-            || session.app.as_ref().map(|app| app.executable.as_str())
-                != Some(current.executable.as_str())
-        {
+        if !session.paused && session.app.is_some() {
             if !self.finish_at(&mut session, now) {
                 return;
             }
-            session.app = Some(current);
-            session.started_at = now;
-            session.last_checkpoint_at = session.started_at;
-            session.paused = false;
+            session.paused = true;
         }
+        session.app = Some(current);
+        session.started_at = now;
+        session.last_checkpoint_at = session.started_at;
+        session.paused = false;
     }
 
     fn checkpoint(&self, session: &mut Session) {
@@ -274,6 +302,10 @@ impl Tracker {
         session.pending_end_at = None;
         true
     }
+}
+
+fn wall_clock_jumped(wall_elapsed_ms: i128, mono_elapsed_ms: i128) -> bool {
+    (wall_elapsed_ms - mono_elapsed_ms).abs() > 3_000
 }
 
 fn should_pause_for_idle(app: &AppInfo, idle_seconds: u64, idle_limit_seconds: u64) -> bool {
@@ -381,6 +413,16 @@ mod tests {
         assert!(!should_pause_for_idle(&app, 3_600, 300));
         assert_eq!(idle_pause_end(1_000_000, 360, 300, false), 940_000);
         assert_eq!(idle_pause_end(1_000_000, 360, 300, true), 1_000_000);
+    }
+
+    #[test]
+    fn clock_jump_detection_distinguishes_steps_and_drift() {
+        assert!(wall_clock_jumped(60 * 60 * 1_000, 1_000)); // forward manual step
+        assert!(wall_clock_jumped(-60 * 60 * 1_000, 1_000)); // backward step
+        assert!(wall_clock_jumped(3 * 60 * 1_000, 1_000)); // forward NTP jump
+        assert!(wall_clock_jumped(29 * 60 * 1_000, 30 * 60 * 1_000)); // wall set back 1 min
+        assert!(!wall_clock_jumped(1_200, 1_000)); // small drift
+        assert!(!wall_clock_jumped(30 * 60 * 1_000 - 1_500, 30 * 60 * 1_000)); // sleep resume
     }
 
     #[test]

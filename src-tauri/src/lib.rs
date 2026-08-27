@@ -7,7 +7,7 @@ use crate::{
     icon_cache::{Cached, IconCache},
     store::{
         today, AllSummary, AppRule, AppRulePatch, Category, DaySummary, LiveStatus, RangeSummary,
-        Settings, Store, WidgetStatus,
+        RecordedBounds, Settings, Store, WidgetStatus,
     },
     tracker::Tracker,
 };
@@ -68,6 +68,12 @@ async fn get_range_summary(
 #[tauri::command]
 async fn get_all_summary(state: State<'_, AppState>) -> Result<AllSummary, String> {
     state.store.all_summary()
+}
+#[tauri::command]
+async fn get_recorded_bounds(
+    state: State<'_, AppState>,
+) -> Result<Option<RecordedBounds>, String> {
+    state.store.recorded_bounds()
 }
 #[tauri::command]
 fn get_categories(state: State<AppState>) -> Result<Vec<Category>, String> {
@@ -132,21 +138,24 @@ async fn get_app_icon(
     executable: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<String, String> {
+    // Ignore UNC/device paths: extracting an icon from a remote share could
+    // trigger SMB connection attempts that block and leak credentials.
     let mut paths = process_path
-        .filter(|path| !path.trim().is_empty())
+        .filter(|path| !path.trim().is_empty() && !path.starts_with(r"\\"))
         .into_iter()
         .collect::<Vec<_>>();
     // A cached answer for the requested path avoids the session history lookup.
     if let Some(path) = paths.first() {
         match state.icons.get(path) {
             Cached::Icon(icon) => return Ok(icon),
-            Cached::Unavailable => return Err("Windows did not provide an application icon".into()),
-            Cached::Missing => {}
+            // A temporarily failed or missing primary path must still let the
+            // historic fallbacks below run.
+            Cached::Unavailable | Cached::Missing => {}
         }
     }
     if let Some(executable) = executable.filter(|value| !value.trim().is_empty()) {
         for path in state.store.icon_paths(&executable)? {
-            if !paths.iter().any(|value| value == &path) {
+            if !path.starts_with(r"\\") && !paths.iter().any(|value| value == &path) {
                 paths.push(path);
             }
         }
@@ -509,6 +518,7 @@ pub fn run() {
             get_widget_status,
             get_range_summary,
             get_all_summary,
+            get_recorded_bounds,
             get_categories,
             create_category,
             delete_category,

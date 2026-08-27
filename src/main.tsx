@@ -10,18 +10,14 @@ import {
   ChevronLeft,
   ChevronRight,
   Clock3,
-  Focus,
   History,
   LayoutGrid,
   Monitor,
-  Pause,
-  Play,
   Plus,
   Settings2,
   Sparkles,
   Tags,
   Trash2,
-  X,
 } from "lucide-react";
 import {
   Area,
@@ -65,8 +61,21 @@ type Day = {
   applications: Item[];
   hours: Item[];
 };
-type Range = { days: Item[]; categories: Item[]; applications: Item[] };
-type All = { months: Item[]; categories: Item[]; applications: Item[] };
+type Range = {
+  totalSeconds: number;
+  days: Item[];
+  categories: Item[];
+  applications: Item[];
+};
+type All = {
+  totalSeconds: number;
+  months: Item[];
+  categories: Item[];
+  applications: Item[];
+};
+/** The first and last local dates that hold usage, used to keep the date
+ * pickers inside the recorded window. */
+type Bounds = { firstDate: string; lastDate: string };
 type Category = { id: number; name: string; color: string };
 type Rule = {
   executable: string;
@@ -86,6 +95,23 @@ type Config = {
   widgetXOffset: number;
   widgetYOffset: number;
 };
+/** A summary paired with the view key it was loaded for, so an in-flight or
+ * failed request can never render old data under a new date heading. */
+type DaySlot = { key: string; data: Day };
+type RangeSlot = { key: string; data: Range };
+type AllSlot = { key: string; data: All };
+
+const viewKeyOf = (
+  page: string,
+  date: string,
+  rangeStart: string,
+  rangeEnd: string,
+) =>
+  page === "today"
+    ? `day-${date}`
+    : page === "range"
+      ? `range-${rangeStart}-${rangeEnd}`
+      : "all";
 
 const formatDuration = (value = 0) =>
   `${Math.floor(value / 3600)}小时${String(Math.floor((value % 3600) / 60)).padStart(2, "0")}分`;
@@ -98,8 +124,33 @@ const invokeSafe = <T,>(name: string, args?: Record<string, unknown>) =>
 const initials = (name: string) => name.trim().slice(0, 1).toUpperCase() || "•";
 const shiftDate = (value: string, days: number) => {
   const [year, month, day] = value.split("-").map(Number);
-  const date = new Date(year, month - 1, day + days);
-  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
+  // UTC civil arithmetic avoids both the Date 0-99 year quirk and the local
+  // timezone's DST gaps when rolling across midnight.
+  const shifted = new Date(0);
+  shifted.setUTCFullYear(year, month - 1, day + days);
+  return `${shifted.getUTCFullYear()}-${String(shifted.getUTCMonth() + 1).padStart(2, "0")}-${String(shifted.getUTCDate()).padStart(2, "0")}`;
+};
+/** Inclusive day count between two ISO dates, using UTC civil arithmetic for the
+ * same reason shiftDate does. */
+const daysBetween = (start: string, end: string) => {
+  const [ys, ms, ds] = start.split("-").map(Number);
+  const [ye, me, de] = end.split("-").map(Number);
+  return (
+    Math.round((Date.UTC(ye, me - 1, de) - Date.UTC(ys, ms - 1, ds)) / 86_400_000) + 1
+  );
+};
+const formatRangeLabel = (start: string, end: string) =>
+  start && end
+    ? `${start.replace(/-/g, "/")} – ${end.replace(/-/g, "/")} · ${daysBetween(start, end)} 天`
+    : "";
+/** Keeps a stored selection inside the recorded window. A stray year in a date
+ * picker used to widen the window silently, so the headline total covered far
+ * more than the dates the user believed were selected. */
+const clampToBounds = (value: string, bounds?: Bounds) => {
+  if (!value || !bounds) return value;
+  if (value < bounds.firstDate) return bounds.firstDate;
+  if (value > bounds.lastDate) return bounds.lastDate;
+  return value;
 };
 const dashboardPages = ["today", "range", "all", "categories", "settings"];
 const APPLICATIONS_PER_PAGE = 7;
@@ -216,20 +267,22 @@ function Dashboard() {
   const [date, setDate] = useState(
     () => localStorage.getItem("momentrace.dashboard.date") ?? "",
   );
-  const [day, setDay] = useState<Day>();
   const [rangeStart, setRangeStart] = useState(
     () => localStorage.getItem("momentrace.dashboard.rangeStart") ?? "",
   );
   const [rangeEnd, setRangeEnd] = useState(
     () => localStorage.getItem("momentrace.dashboard.rangeEnd") ?? "",
   );
-  const [range, setRange] = useState<Range>();
-  const [all, setAll] = useState<All>();
+  const [daySlot, setDaySlot] = useState<DaySlot>();
+  const [rangeSlot, setRangeSlot] = useState<RangeSlot>();
+  const [allSlot, setAllSlot] = useState<AllSlot>();
   const [status, setStatus] = useState<Status>();
   const [categories, setCategories] = useState<Category[]>([]);
   const [rules, setRules] = useState<Rule[]>([]);
   const [settings, setSettings] = useState<Config>();
+  const [bounds, setBounds] = useState<Bounds>();
   const loadId = useRef(0);
+  const statusRevision = useRef(0);
   const view = useRef({ page, date, rangeStart, rangeEnd });
   useEffect(() => {
     view.current = { page, date, rangeStart, rangeEnd };
@@ -245,47 +298,117 @@ function Dashboard() {
   }, [settings?.fontFamily]);
   const load = async () => {
     const requestId = ++loadId.current;
+    const revisionAtFetch = statusRevision.current;
     try {
-      const selectedDate = date || (await invokeSafe<string>("get_today"));
-      if (!date) setDate(selectedDate);
-      const selectedRangeEnd = rangeEnd || selectedDate;
-      const selectedRangeStart = rangeStart || shiftDate(selectedRangeEnd, -6);
-      if (!rangeStart) setRangeStart(selectedRangeStart);
-      if (!rangeEnd) setRangeEnd(selectedRangeEnd);
-      const [
-        dayData,
-        rangeData,
-        allData,
-        live,
-        categoryData,
-        ruleData,
-        settingData,
-      ] = await Promise.all([
-        invokeSafe<Day>("get_day_summary", { date: selectedDate }),
-        invokeSafe<Range>("get_range_summary", {
-          startDate: selectedRangeStart,
-          endDate: selectedRangeEnd,
-        }),
-        invokeSafe<All>("get_all_summary"),
-        invokeSafe<Status>("get_live_status"),
-        invokeSafe<Category[]>("get_categories"),
-        invokeSafe<Rule[]>("get_app_rules"),
-        invokeSafe<Config>("get_settings"),
+      const [today, recorded] = await Promise.all([
+        invokeSafe<string>("get_today"),
+        invokeSafe<Bounds | null>("get_recorded_bounds").catch(() => null),
       ]);
       if (requestId !== loadId.current) return;
-      setDay(dayData);
-      setRange(rangeData);
-      setAll(allData);
-      setStatus(live);
-      setCategories(categoryData);
-      setRules(ruleData);
-      setSettings(settingData);
+      // Today stays selectable even before it holds any usage, but dates
+      // outside [first recorded day, today] cannot be chosen at all.
+      const limits = recorded
+        ? {
+            firstDate: recorded.firstDate,
+            lastDate: recorded.lastDate > today ? recorded.lastDate : today,
+          }
+        : undefined;
+      if (limits) setBounds(limits);
+      const selectedDate = clampToBounds(date || today, limits);
+      if (date !== selectedDate)
+        setDate((current) => (current === date ? selectedDate : current));
+      const selectedRangeEnd = clampToBounds(rangeEnd || selectedDate, limits);
+      const selectedRangeStart = clampToBounds(
+        rangeStart || shiftDate(selectedRangeEnd, -6),
+        limits,
+      );
+      // Updater form: a value typed while this load was in flight must win over
+      // the fallback resolved from the state this load started with.
+      if (rangeStart !== selectedRangeStart)
+        setRangeStart((current) =>
+          current === rangeStart ? selectedRangeStart : current,
+        );
+      if (rangeEnd !== selectedRangeEnd)
+        setRangeEnd((current) =>
+          current === rangeEnd ? selectedRangeEnd : current,
+        );
+      const commit = async <X,>(
+        promise: Promise<X>,
+        apply: (value: X) => void,
+      ) => {
+        try {
+          apply(await promise);
+        } catch (error) {
+          console.error("Unable to load dashboard data", error);
+        }
+      };
+      if (requestId !== loadId.current) return;
+      const isCurrent = () => requestId === loadId.current;
+      await Promise.all([
+        commit(invokeSafe<Status>("get_live_status"), (live) => {
+          if (isCurrent() && statusRevision.current === revisionAtFetch)
+            setStatus(live);
+        }),
+        commit(invokeSafe<Category[]>("get_categories"), (value) => {
+          if (isCurrent()) setCategories(value);
+        }),
+        commit(invokeSafe<Rule[]>("get_app_rules"), (value) => {
+          if (isCurrent()) setRules(value);
+        }),
+        commit(invokeSafe<Config>("get_settings"), (value) => {
+          if (isCurrent()) setSettings(value);
+        }),
+        ...(page === "today"
+          ? [
+              commit(
+                invokeSafe<Day>("get_day_summary", { date: selectedDate }),
+                (value) => {
+                  if (isCurrent())
+                    setDaySlot({
+                      key: viewKeyOf("today", selectedDate, "", ""),
+                      data: value,
+                    });
+                },
+              ),
+            ]
+          : []),
+        ...(page === "range"
+          ? [
+              commit(
+                invokeSafe<Range>("get_range_summary", {
+                  startDate: selectedRangeStart,
+                  endDate: selectedRangeEnd,
+                }),
+                (value) => {
+                  if (isCurrent())
+                    setRangeSlot({
+                      key: viewKeyOf(
+                        "range",
+                        "",
+                        selectedRangeStart,
+                        selectedRangeEnd,
+                      ),
+                      data: value,
+                    });
+                },
+              ),
+            ]
+          : []),
+        ...(page === "all"
+          ? [
+              commit(invokeSafe<All>("get_all_summary"), (value) => {
+                if (isCurrent()) setAllSlot({ key: "all", data: value });
+              }),
+            ]
+          : []),
+      ]);
     } catch (error) {
       console.error("Unable to load dashboard data", error);
     }
   };
   const refresh = async () => {
     const requestId = loadId.current;
+    const revisionAtFetch = statusRevision.current;
     const {
       page: activePage,
       date: activeDate,
@@ -297,6 +420,7 @@ function Dashboard() {
       let nextDay: Day | undefined;
       let nextRange: Range | undefined;
       let nextAll: All | undefined;
+      let rangeWindow: { start: string; end: string } | undefined;
       if (activePage === "today") {
         nextDay = await invokeSafe<Day>("get_day_summary", {
           date: activeDate || (await invokeSafe<string>("get_today")),
@@ -304,29 +428,53 @@ function Dashboard() {
       } else if (activePage === "range") {
         const selectedEnd =
           activeEnd || activeDate || (await invokeSafe<string>("get_today"));
+        rangeWindow = {
+          start: activeStart || shiftDate(selectedEnd, -6),
+          end: selectedEnd,
+        };
         nextRange = await invokeSafe<Range>("get_range_summary", {
-          startDate: activeStart || shiftDate(selectedEnd, -6),
-          endDate: selectedEnd,
+          startDate: rangeWindow.start,
+          endDate: rangeWindow.end,
         });
       } else if (activePage === "all") {
         nextAll = await invokeSafe<All>("get_all_summary");
       }
       if (requestId !== loadId.current) return;
-      setStatus(live);
-      if (nextDay) setDay(nextDay);
-      if (nextRange) setRange(nextRange);
-      if (nextAll) setAll(nextAll);
+      if (statusRevision.current === revisionAtFetch) setStatus(live);
+      if (nextDay) {
+        setDaySlot({
+          key: viewKeyOf("today", activeDate || "", "", ""),
+          data: nextDay,
+        });
+      }
+      if (nextRange && rangeWindow) {
+        // Key the slot with the window that was actually queried, so a summary
+        // can never be rendered under a different pair of dates.
+        setRangeSlot({
+          key: viewKeyOf("range", "", rangeWindow.start, rangeWindow.end),
+          data: nextRange,
+        });
+      }
+      if (nextAll) setAllSlot({ key: "all", data: nextAll });
     } catch (error) {
       console.error("Unable to refresh dashboard data", error);
     }
   };
   useEffect(() => {
     void load();
+  }, [page, date, rangeStart, rangeEnd]);
+  // Registered once for the lifetime of the dashboard. Re-running this whenever
+  // the selected dates changed used to tear down the tracker-status listener and
+  // restart the timer, so live updates were dropped while the subscription was
+  // being re-established and the periodic refresh never fired for anyone who
+  // kept adjusting the selection. Everything below reads refs, so the closure
+  // captured here always sees the current view.
+  useEffect(() => {
     const timer = window.setInterval(() => void refresh(), 30_000);
-    const nav = listen<string>("navigate", (event) => setPage(event.payload));
-    const live = listen<Status>("tracker-status", (event) =>
-      setStatus(event.payload),
-    );
+    const live = listen<Status>("tracker-status", (event) => {
+      statusRevision.current += 1;
+      setStatus(event.payload);
+    });
     const widget = listen<boolean>("widget-visibility", (event) =>
       setSettings((current) =>
         current ? { ...current, showWidget: event.payload } : current,
@@ -334,11 +482,10 @@ function Dashboard() {
     );
     return () => {
       window.clearInterval(timer);
-      void nav.then((unlisten) => unlisten());
       void live.then((unlisten) => unlisten());
       void widget.then((unlisten) => unlisten());
     };
-  }, [date, rangeStart, rangeEnd]);
+  }, []);
   const nav = [
     { id: "today", label: "今天", icon: Clock3 },
     { id: "range", label: "时间段", icon: CalendarRange },
@@ -356,6 +503,31 @@ function Dashboard() {
           : page === "categories"
             ? "把时间归于意义。"
             : "让记录顺其自然。";
+  // Hover text only, so a mistyped year is still verifiable without touching
+  // the layout of the header.
+  const rangeTitle = formatRangeLabel(rangeStart, rangeEnd)
+    ? `统计区间 ${formatRangeLabel(rangeStart, rangeEnd)}`
+    : "统计区间";
+  const settingsIntent = useRef<Config>();
+  const settingsSaving = useRef(false);
+  const saveSettings = (next: Config) => {
+    settingsIntent.current = next;
+    setSettings(next);
+    if (settingsSaving.current) return;
+    settingsSaving.current = true;
+    void (async () => {
+      while (true) {
+        const target = settingsIntent.current!;
+        try {
+          await invokeSafe("update_settings", { settings: target });
+        } catch (error) {
+          if (settingsIntent.current === target) alert(String(error));
+        }
+        if (settingsIntent.current === target) break;
+      }
+      settingsSaving.current = false;
+    })();
+  };
   const saveRule = async (rule: Rule, patch: Partial<Rule>) => {
     setRules((current) =>
       current.map((item) =>
@@ -452,7 +624,11 @@ function Dashboard() {
               <input
                 type="date"
                 value={date}
-                onChange={(event) => setDate(event.target.value)}
+                min={bounds?.firstDate}
+                max={bounds?.lastDate}
+                onChange={(event) =>
+                  setDate(clampToBounds(event.target.value, bounds))
+                }
               />
             )}
             {page === "range" && (
@@ -461,10 +637,12 @@ function Dashboard() {
                   type="date"
                   className="range-date"
                   aria-label="开始日期"
+                  title={rangeTitle}
                   value={rangeStart}
-                  max={rangeEnd}
+                  min={bounds?.firstDate}
+                  max={rangeEnd || bounds?.lastDate}
                   onChange={(event) => {
-                    const value = event.target.value;
+                    const value = clampToBounds(event.target.value, bounds);
                     setRangeStart(value);
                     if (rangeEnd && value > rangeEnd) setRangeEnd(value);
                   }}
@@ -473,10 +651,12 @@ function Dashboard() {
                   type="date"
                   className="range-date"
                   aria-label="结束日期"
+                  title={rangeTitle}
                   value={rangeEnd}
-                  min={rangeStart}
+                  min={rangeStart || bounds?.firstDate}
+                  max={bounds?.lastDate}
                   onChange={(event) => {
-                    const value = event.target.value;
+                    const value = clampToBounds(event.target.value, bounds);
                     setRangeEnd(value);
                     if (rangeStart && value < rangeStart) setRangeStart(value);
                   }}
@@ -515,8 +695,22 @@ function Dashboard() {
                   ? `range-${rangeStart}-${rangeEnd}`
                   : "all"
             }
-            data={page === "all" ? all : page === "range" ? range : day}
-            period={page === "all" ? "all" : page === "range" ? "range" : "day"}
+            data={
+              page === "all"
+                ? allSlot?.key === "all"
+                  ? allSlot.data
+                  : undefined
+                : page === "range"
+                  ? rangeSlot?.key === `range-${rangeStart}-${rangeEnd}`
+                    ? rangeSlot.data
+                    : undefined
+                  : daySlot?.key === `day-${date}`
+                    ? daySlot.data
+                    : undefined
+            }
+            period={
+              page === "all" ? "all" : page === "range" ? "range" : "day"
+            }
             current={status?.currentApp}
           />
         ) : null}
@@ -527,14 +721,7 @@ function Dashboard() {
           <Settings
             settings={settings}
             categories={categories}
-            save={async (next) => {
-              try {
-                await invokeSafe("update_settings", { settings: next });
-                setSettings(next);
-              } catch (error) {
-                alert(String(error));
-              }
-            }}
+            save={saveSettings}
             createCategory={async (name, color) => {
               await invokeSafe("create_category", { name, color });
               await load();
@@ -579,12 +766,10 @@ function Overview({
   }
   const isRange = period === "range";
   const isAll = period === "all";
-  const total =
-    period === "day"
-      ? (data as Day)?.totalSeconds
-      : isAll
-        ? (data as All)?.months.reduce((sum, item) => sum + item.seconds, 0)
-        : (data as Range)?.days.reduce((sum, item) => sum + item.seconds, 0);
+  // Every summary reports its own total, clipped to the window it was queried
+  // for. Re-adding the per-bucket values here used to lose a second per day and
+  // could not tell whether the buckets covered the selected dates at all.
+  const total = data?.totalSeconds;
   const categories = data?.categories ?? [];
   const apps = data?.applications ?? [];
   const chartData =
@@ -1033,7 +1218,7 @@ function Settings({
 }: {
   settings?: Config;
   categories: Category[];
-  save: (settings: Config) => Promise<void>;
+  save: (settings: Config) => void | Promise<void>;
   createCategory: (name: string, color: string) => Promise<void>;
   deleteCategory: (id: number) => Promise<void>;
   clear: () => Promise<void>;

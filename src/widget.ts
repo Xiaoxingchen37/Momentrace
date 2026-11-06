@@ -21,8 +21,9 @@ type WidgetStatus = {
   currentAppSeconds?: number | null;
 };
 
-type FontFamily = "classic" | "serif" | "sans";
-type Settings = { fontFamily?: FontFamily | null };
+type FontFamily = "system" | "custom";
+type Settings = { fontFamily?: FontFamily | null; fontName?: string | null };
+type FontSelection = { family: FontFamily; name?: string | null };
 
 const root = document.getElementById("root");
 if (!root) throw new Error("Widget root element is missing");
@@ -55,13 +56,50 @@ let statusRevision = 0;
 let fontRevision = 0;
 
 const normalizeFontFamily = (value?: string | null): FontFamily =>
-  value === "serif" || value === "sans" ? value : "classic";
+  value === "custom" ? "custom" : "system";
 
-const applyFontFamily = (value?: string | null) => {
+const sanitizeFontName = (value?: string | null) =>
+  (value ?? "")
+    .replace(/["'\\;{}<>]/g, "")
+    .trim()
+    .slice(0, 64);
+
+const applyFontFamily = (value?: string | null, name?: string | null) => {
   const fontFamily = normalizeFontFamily(value);
-  document.documentElement.dataset.font = fontFamily;
+  const fontName = fontFamily === "custom" ? sanitizeFontName(name) : "";
+  const root = document.documentElement;
+  root.dataset.font =
+    fontFamily === "custom" && !fontName ? "system" : fontFamily;
+  if (fontName) root.style.setProperty("--custom-font", `"${fontName}"`);
+  else root.style.removeProperty("--custom-font");
   localStorage.setItem("momentrace.fontFamily", fontFamily);
+  localStorage.setItem("momentrace.fontName", fontName);
 };
+
+/** The widget window is a separate document, so it resolves the system face on
+ * its own instead of relying on the dashboard having done it. */
+const loadSystemUiFont = async () => {
+  try {
+    const face = sanitizeFontName(await invoke<string>("get_system_ui_font"));
+    if (face) {
+      document.documentElement.style.setProperty("--system-font", `"${face}"`);
+      localStorage.setItem("momentrace.systemFont", face);
+    }
+  } catch {
+    // The stylesheet stack already covers a failed lookup.
+  }
+};
+
+const cachedSystemFont = sanitizeFontName(
+  localStorage.getItem("momentrace.systemFont"),
+);
+if (cachedSystemFont) {
+  document.documentElement.style.setProperty(
+    "--system-font",
+    `"${cachedSystemFont}"`,
+  );
+}
+void loadSystemUiFont();
 
 const initials = (name: string) => name.trim().slice(0, 1).toUpperCase() || "·";
 
@@ -124,15 +162,18 @@ const render = (status: WidgetStatus) => {
   void updateIcon(name, current?.processPath, current?.executable);
 };
 
-applyFontFamily(localStorage.getItem("momentrace.fontFamily"));
+applyFontFamily(
+  localStorage.getItem("momentrace.fontFamily"),
+  localStorage.getItem("momentrace.fontName"),
+);
 
 const statusListener = listen<WidgetStatus>("widget-status", (event) => {
   statusRevision += 1;
   render(event.payload);
 });
-const fontListener = listen<string>("font-family-changed", (event) => {
+const fontListener = listen<FontSelection>("font-family-changed", (event) => {
   fontRevision += 1;
-  applyFontFamily(event.payload);
+  applyFontFamily(event.payload.family, event.payload.name);
 });
 
 void statusListener.catch(() => undefined);
@@ -147,7 +188,8 @@ void invoke<WidgetStatus>("get_widget_status")
 const initialFontRevision = fontRevision;
 void invoke<Settings>("get_settings")
   .then((settings) => {
-    if (initialFontRevision === fontRevision) applyFontFamily(settings.fontFamily);
+    if (initialFontRevision === fontRevision)
+      applyFontFamily(settings.fontFamily, settings.fontName);
   })
   .catch(() => undefined);
 

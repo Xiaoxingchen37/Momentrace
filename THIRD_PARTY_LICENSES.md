@@ -1,6 +1,9 @@
 # Third-Party Font Licenses
 
-Momentrace bundles Noto Sans SC and Noto Serif SC through Fontsource.
+Momentrace bundles Noto Sans SC and Noto Serif SC through Fontsource. They are
+only used when a bundled face is explicitly selected; the default design renders
+with the Windows interface font instead, and a user-chosen installed font
+replaces it entirely.
 
 Copyright: Google Inc.
 

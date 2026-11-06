@@ -1,28 +1,17 @@
-@font-face {
-  font-family: "Source Han Serif SC VF";
-  src:
-    local("Source Han Serif SC VF"),
-    local("Source Han Serif SC"),
-    local("Noto Serif CJK SC");
-  font-display: swap;
-}
-
 :root {
-  --ui-font: "Microsoft YaHei UI", "Noto Sans SC Variable", sans-serif;
-  --display-font: "Noto Serif SC Variable", serif;
+  /* Replaced at runtime with the Windows interface face. */
+  --system-font: "Microsoft YaHei UI";
+  --ui-font: var(--system-font), "Segoe UI Variable Text", "Noto Sans SC Variable", sans-serif;
+  /* The taskbar row follows the machine's own type unless asked otherwise. */
+  --display-font: var(--ui-font);
   color: #20293c;
   background: transparent;
   font-family: var(--ui-font);
 }
 
-:root[data-font="serif"] {
-  --ui-font: "Noto Serif SC Variable", serif;
-  --display-font: "Noto Serif SC Variable", serif;
-}
-
-:root[data-font="sans"] {
-  --ui-font: "Noto Sans SC Variable", sans-serif;
-  --display-font: "Noto Sans SC Variable", sans-serif;
+:root[data-font="custom"] {
+  --ui-font: var(--custom-font), "Microsoft YaHei UI", sans-serif;
+  --display-font: var(--ui-font);
 }
 
 * {
@@ -73,7 +62,7 @@ body.widget-view .taskbar-overlay .app-icon {
   background: var(--app-icon-background, #fff);
   box-shadow: 0 4px 12px rgb(40 72 105 / 12%);
   color: #27769f;
-  font: 700 15px "Source Han Serif SC VF", serif;
+  font: 700 15px var(--display-font);
 }
 
 body.widget-view .taskbar-overlay .app-icon img {
@@ -97,7 +86,7 @@ body.widget-view .taskbar-app-copy b {
   margin: 0;
   overflow: hidden;
   color: #20293c;
-  font: 700 16px/1.05 Inter, "Microsoft YaHei UI", sans-serif;
+  font: 700 16px/1.05 var(--ui-font);
   text-overflow: ellipsis;
   text-shadow: none;
   white-space: nowrap;
@@ -107,7 +96,7 @@ body.widget-view .taskbar-app-copy span {
   margin: 0;
   overflow: hidden;
   color: #9aa3b3;
-  font: 500 12px/1.05 "Source Han Serif SC VF", "Microsoft YaHei UI", sans-serif;
+  font: 500 12px/1.05 var(--display-font);
   letter-spacing: 0;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -116,7 +105,7 @@ body.widget-view .taskbar-app-copy span {
 body.widget-view .taskbar-overlay > strong {
   align-self: center;
   color: #1686ef;
-  font: 500 21px/1 "Source Han Serif SC VF", "Microsoft YaHei UI", sans-serif;
+  font: 500 21px/1 var(--display-font);
   letter-spacing: 0;
   white-space: nowrap;
 }
@@ -130,8 +119,7 @@ body.widget-view .taskbar-overlay > strong {
   font-family: var(--display-font);
 }
 
-:root[data-font="serif"] body.widget-view *,
-:root[data-font="sans"] body.widget-view * {
+:root[data-font="custom"] body.widget-view * {
   font-family: var(--ui-font);
 }
 

@@ -1,6 +1,7 @@
 mod app_icon;
 mod icon_cache;
 mod store;
+mod system_font;
 mod tracker;
 
 use crate::{
@@ -33,6 +34,15 @@ use windows61::Win32::{
         WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT,
     },
 };
+
+/// Emitted to every window when the typography setting changes, so the taskbar
+/// widget and the dashboard never disagree about the chosen face.
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FontSelection {
+    family: String,
+    name: String,
+}
 
 struct AppState {
     store: Arc<Store>,
@@ -103,6 +113,17 @@ fn update_app_rule(
 fn get_settings(state: State<AppState>) -> Result<Settings, String> {
     state.store.settings()
 }
+/// The face the Windows shell itself uses, so the dashboard can default to the
+/// same typography as the rest of the desktop.
+#[tauri::command]
+fn get_system_ui_font() -> String {
+    system_font::ui_font()
+}
+/// Every font family installed for this user or for the machine.
+#[tauri::command]
+fn get_system_fonts() -> Vec<String> {
+    system_font::installed_fonts()
+}
 #[tauri::command]
 fn update_settings(
     settings: Settings,
@@ -117,7 +138,13 @@ fn update_settings(
     let saved_settings = state.store.settings()?;
     state.tracker.set_idle_minutes(settings.idle_minutes);
     set_widget_visibility(&app, settings.show_widget);
-    let _ = app.emit("font-family-changed", saved_settings.font_family);
+    let _ = app.emit(
+        "font-family-changed",
+        FontSelection {
+            family: saved_settings.font_family,
+            name: saved_settings.font_name,
+        },
+    );
     Ok(())
 }
 #[tauri::command]
@@ -469,7 +496,8 @@ pub fn run() {
                 idle_minutes: 5,
                 launch_at_login: false,
                 show_widget: true,
-                font_family: "classic".into(),
+                font_family: "system".into(),
+                font_name: String::new(),
                 widget_height: 64,
                 widget_x_offset: 0,
                 widget_y_offset: 0,
@@ -525,6 +553,8 @@ pub fn run() {
             get_app_rules,
             update_app_rule,
             get_settings,
+            get_system_ui_font,
+            get_system_fonts,
             update_settings,
             set_tracking_paused,
             clear_usage_data,

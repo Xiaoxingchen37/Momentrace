@@ -137,6 +137,9 @@ pub struct Settings {
     pub launch_at_login: bool,
     pub show_widget: bool,
     pub font_family: String,
+    /// A font face installed on this machine, used when `font_family` is
+    /// `custom`. Empty means "use the template's own stack".
+    pub font_name: String,
     pub widget_height: u32,
     pub widget_x_offset: i32,
     pub widget_y_offset: i32,
@@ -254,7 +257,22 @@ impl Store {
             .map_err(|err| err.to_string())?;
         connection
             .execute(
-                "INSERT OR IGNORE INTO settings(key, value) VALUES ('font_family', 'classic')",
+                "INSERT OR IGNORE INTO settings(key, value) VALUES ('font_family', 'system')",
+                [],
+            )
+            .map_err(|err| err.to_string())?;
+        connection
+            .execute(
+                "INSERT OR IGNORE INTO settings(key, value) VALUES ('font_name', '')",
+                [],
+            )
+            .map_err(|err| err.to_string())?;
+        // The default is now the Windows interface font. Any legacy value that
+        // is not an explicit installed-face choice is collapsed to it, so an
+        // existing install follows the machine instead of a retired mode.
+        connection
+            .execute(
+                "UPDATE settings SET value='system' WHERE key='font_family' AND value NOT IN ('system','custom')",
                 [],
             )
             .map_err(|err| err.to_string())?;
@@ -582,6 +600,13 @@ impl Store {
                 |row| row.get(0),
             )
             .map_err(|err| err.to_string())?;
+        let font_name: String = connection
+            .query_row(
+                "SELECT value FROM settings WHERE key='font_name'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or_default();
         let widget_height: String = connection
             .query_row(
                 "SELECT value FROM settings WHERE key='widget_height'",
@@ -611,6 +636,7 @@ impl Store {
             launch_at_login: autostart == "true",
             show_widget: show_widget == "true",
             font_family: normalize_font_family(&font_family).into(),
+            font_name: normalize_font_name(&font_name),
             widget_height: widget_height.parse().unwrap_or(64).clamp(48, 160),
             widget_x_offset: widget_x_offset.parse().unwrap_or(0).clamp(-1000, 1000),
             widget_y_offset: widget_y_offset.parse().unwrap_or(0).clamp(-1000, 1000),
@@ -638,6 +664,11 @@ impl Store {
         tx.execute(
             "UPDATE settings SET value=?1 WHERE key='font_family'",
             params![normalize_font_family(&settings.font_family)],
+        )
+        .map_err(|err| err.to_string())?;
+        tx.execute(
+            "UPDATE settings SET value=?1 WHERE key='font_name'",
+            params![normalize_font_name(&settings.font_name)],
         )
         .map_err(|err| err.to_string())?;
         for (key, value) in [
@@ -1039,12 +1070,33 @@ pub fn today() -> String {
     Local::now().format("%Y-%m-%d").to_string()
 }
 
+/// Two modes only: the shipped original (the Windows interface face) and a face
+/// installed on this machine. Older values collapse into the original, which is
+/// what they visually were.
 fn normalize_font_family(value: &str) -> &'static str {
     match value {
-        "serif" => "serif",
-        "sans" => "sans",
-        _ => "classic",
+        "custom" => "custom",
+        _ => "system",
     }
+}
+
+/// Face names reach the stylesheet, so anything that could break out of a CSS
+/// font stack (`"`, `;`, braces, controls) is rejected rather than escaped.
+fn normalize_font_name(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed.chars().count() > 64 {
+        return String::new();
+    }
+    if trimmed
+        .chars()
+        .any(|character| {
+            character.is_control()
+                || matches!(character, '"' | '\'' | '\\' | ';' | '{' | '}' | '<' | '>')
+        })
+    {
+        return String::new();
+    }
+    trimmed.to_string()
 }
 
 fn normalize_color(value: &str) -> Result<String, String> {
@@ -1160,19 +1212,26 @@ mod tests {
     fn font_family_setting_is_persisted_and_validated() {
         let (_directory, store) = test_store();
         let mut settings = store.settings().unwrap();
-        assert_eq!(settings.font_family, "classic");
+        assert_eq!(settings.font_family, "system");
+        assert_eq!(settings.font_name, "");
 
-        settings.font_family = "serif".into();
+        settings.font_family = "custom".into();
+        settings.font_name = "MiSans".into();
         store.update_settings(&settings).unwrap();
-        assert_eq!(store.settings().unwrap().font_family, "serif");
+        let saved = store.settings().unwrap();
+        assert_eq!(saved.font_family, "custom");
+        assert_eq!(saved.font_name, "MiSans");
 
-        settings.font_family = "untrusted-value".into();
+        // A retired mode and an unsafe face both fall back to the original.
+        settings.font_family = "serif".into();
+        settings.font_name = "Bad\"; color: red".into();
         settings.widget_height = 999;
         settings.widget_x_offset = -5000;
         settings.widget_y_offset = 5000;
         store.update_settings(&settings).unwrap();
         let settings = store.settings().unwrap();
-        assert_eq!(settings.font_family, "classic");
+        assert_eq!(settings.font_family, "system");
+        assert_eq!(settings.font_name, "");
         assert_eq!(settings.widget_height, 160);
         assert_eq!(settings.widget_x_offset, -1000);
         assert_eq!(settings.widget_y_offset, 1000);

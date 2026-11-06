@@ -85,12 +85,17 @@ type Rule = {
   ignored: boolean;
   continueTrackingWhileIdle: boolean;
 };
-type FontFamily = "classic" | "serif" | "sans";
+/** "system" is the shipped original design (Windows interface face for both
+ * text and headings); "custom" is any face installed on this machine. */
+type FontFamily = "system" | "custom";
 type Config = {
   idleMinutes: number;
   launchAtLogin: boolean;
   showWidget: boolean;
   fontFamily: FontFamily;
+  /** A face installed on this machine, only meaningful when fontFamily is
+   * "custom". */
+  fontName: string;
   widgetHeight: number;
   widgetXOffset: number;
   widgetYOffset: number;
@@ -154,19 +159,77 @@ const clampToBounds = (value: string, bounds?: Bounds) => {
 };
 const dashboardPages = ["today", "range", "all", "categories", "settings"];
 const APPLICATIONS_PER_PAGE = 7;
-const storedPage = () => {
+/** The local calendar date straight from the OS clock. Recording stores local
+ * day boundaries, so "today" has to be derived the same way instead of from a
+ * remembered date that silently goes stale overnight. */
+const localToday = () => {
+  const now = new Date();
+  return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
+};
+/** A remembered 今天 date is only reused while it still is today, so reopening
+ * the app on a new day shows that day's usage rather than yesterday's. */
+const storedToday = () => {
+  if (localStorage.getItem("momentrace.dashboard.dateStamp") !== localToday())
+    return "";
+  return localStorage.getItem("momentrace.dashboard.date") || localToday();
+};const storedPage = () => {
   const value = localStorage.getItem("momentrace.dashboard.page");
   return value && dashboardPages.includes(value) ? value : "today";
 };
 const normalizeFontFamily = (value?: string | null): FontFamily =>
-  value === "serif" || value === "sans" ? value : "classic";
-const applyFontFamily = (value?: string | null) => {
+  value === "custom" ? "custom" : "system";
+/** Only a name the user picked from the installed list is ever written into the
+ * stylesheet, and quotes/braces are stripped so a stray character cannot end the
+ * font stack early. */
+const sanitizeFontName = (value?: string | null) =>
+  (value ?? "")
+    .replace(/["'\\;{}<>]/g, "")
+    .trim()
+    .slice(0, 64);
+const applyFontFamily = (value?: string | null, name?: string | null) => {
   const fontFamily = normalizeFontFamily(value);
-  document.documentElement.dataset.font = fontFamily;
+  const fontName = fontFamily === "custom" ? sanitizeFontName(name) : "";
+  const root = document.documentElement;
+  // A missing face name still has to render, so "custom" without one falls back
+  // to the system stack rather than to a CSS keyword no font matches.
+  root.dataset.font =
+    fontFamily === "custom" && !fontName ? "system" : fontFamily;
+  if (fontName) root.style.setProperty("--custom-font", `"${fontName}"`);
+  else root.style.removeProperty("--custom-font");
   localStorage.setItem("momentrace.fontFamily", fontFamily);
+  localStorage.setItem("momentrace.fontName", fontName);
 };
 
-applyFontFamily(localStorage.getItem("momentrace.fontFamily"));
+/** The Windows interface face, so "follow the system" tracks the machine
+ * rather than a hard-coded family. Resolved once and kept in a CSS variable. */
+const loadSystemUiFont = async () => {
+  try {
+    const face = await invokeSafe<string>("get_system_ui_font");
+    const clean = sanitizeFontName(face);
+    if (clean) {
+      document.documentElement.style.setProperty("--system-font", `"${clean}"`);
+      localStorage.setItem("momentrace.systemFont", clean);
+    }
+  } catch {
+    // The stylesheet stack already covers a failed lookup.
+  }
+};
+
+const cachedSystemFont = sanitizeFontName(
+  localStorage.getItem("momentrace.systemFont"),
+);
+if (cachedSystemFont) {
+  document.documentElement.style.setProperty(
+    "--system-font",
+    `"${cachedSystemFont}"`,
+  );
+}
+void loadSystemUiFont();
+
+applyFontFamily(
+  localStorage.getItem("momentrace.fontFamily"),
+  localStorage.getItem("momentrace.fontName"),
+);
 
 type IconVisual = { source: string; background: string };
 const ICON_CACHE_LIMIT = 192;
@@ -264,9 +327,7 @@ function AppIcon({
 
 function Dashboard() {
   const [page, setPage] = useState(storedPage);
-  const [date, setDate] = useState(
-    () => localStorage.getItem("momentrace.dashboard.date") ?? "",
-  );
+  const [date, setDate] = useState(storedToday);
   const [rangeStart, setRangeStart] = useState(
     () => localStorage.getItem("momentrace.dashboard.rangeStart") ?? "",
   );
@@ -290,12 +351,31 @@ function Dashboard() {
   useEffect(() => {
     localStorage.setItem("momentrace.dashboard.page", page);
     localStorage.setItem("momentrace.dashboard.date", date);
+    localStorage.setItem("momentrace.dashboard.dateStamp", localToday());
     localStorage.setItem("momentrace.dashboard.rangeStart", rangeStart);
     localStorage.setItem("momentrace.dashboard.rangeEnd", rangeEnd);
   }, [page, date, rangeStart, rangeEnd]);
   useEffect(() => {
-    if (settings) applyFontFamily(settings.fontFamily);
-  }, [settings?.fontFamily]);
+    if (settings) applyFontFamily(settings.fontFamily, settings.fontName);
+  }, [settings?.fontFamily, settings?.fontName]);
+  // A dashboard left open past midnight kept showing the previous day, because
+  // the date was only resolved on mount. Re-check the OS clock every minute and
+  // roll 今天 forward as soon as the local date actually changes.
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      const now = localToday();
+      const stamp = localStorage.getItem("momentrace.dashboard.dateStamp");
+      if (stamp === now) return;
+      localStorage.setItem("momentrace.dashboard.dateStamp", now);
+      // Only an untouched "today" selection follows the clock; a date the user
+      // picked by hand stays where they put it.
+      const advance = (current: string) =>
+        !current || current === stamp ? now : current;
+      setDate(advance);
+      setRangeEnd(advance);
+    }, 60_000);
+    return () => window.clearInterval(timer);
+  }, []);
   const load = async () => {
     const requestId = ++loadId.current;
     const revisionAtFetch = statusRevision.current;
@@ -621,15 +701,26 @@ function Dashboard() {
           </div>
           <div className="header-actions">
             {page === "today" && (
-              <input
-                type="date"
-                value={date}
-                min={bounds?.firstDate}
-                max={bounds?.lastDate}
-                onChange={(event) =>
-                  setDate(clampToBounds(event.target.value, bounds))
-                }
-              />
+              <div className="today-picker">
+                <input
+                  type="date"
+                  value={date}
+                  min={bounds?.firstDate}
+                  max={bounds?.lastDate}
+                  onChange={(event) =>
+                    setDate(clampToBounds(event.target.value, bounds))
+                  }
+                />
+                {date !== localToday() ? (
+                  <button
+                    type="button"
+                    className="today-reset"
+                    onClick={() => setDate(localToday())}
+                  >
+                    回到今天
+                  </button>
+                ) : null}
+              </div>
             )}
             {page === "range" && (
               <>
@@ -1208,6 +1299,143 @@ function Categories({
     </article>
   );
 }
+/** Typography picker: the shipped original, plus every face installed on this
+ * machine in a filterable list. The list is read on first open because
+ * enumerating fonts touches the whole GDI font table. */
+function FontSetting({
+  settings,
+  save,
+}: {
+  settings: Config;
+  save: (settings: Config) => void | Promise<void>;
+}) {
+  const [fonts, setFonts] = useState<string[]>();
+  const [loading, setLoading] = useState(false);
+  const [query, setQuery] = useState("");
+  const [open, setOpen] = useState(false);
+  const [original, setOriginal] = useState("");
+
+  useEffect(() => {
+    void (async () => {
+      try {
+        setOriginal(await invokeSafe<string>("get_system_ui_font"));
+      } catch {
+        // The label simply omits the face name when the query fails.
+      }
+    })();
+  }, []);
+
+  const loadFonts = async () => {
+    if (fonts || loading) return;
+    setLoading(true);
+    try {
+      setFonts(await invokeSafe<string[]>("get_system_fonts"));
+    } catch (error) {
+      console.error("Unable to list installed fonts", error);
+      setFonts([]);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const usingOriginal = settings.fontFamily !== "custom";
+  const needle = query.trim().toLowerCase();
+  const matches = (fonts ?? []).filter(
+    (name) => !needle || name.toLowerCase().includes(needle),
+  );
+  const choose = (name: string) => {
+    setOpen(false);
+    setQuery("");
+    void save({ ...settings, fontFamily: "custom", fontName: name });
+  };
+
+  return (
+    <div className="font-setting">
+      <div className="font-setting-head">
+        <span className="eyebrow">界面字体</span>
+        <b>字体风格</b>
+        <small>
+          原版设计为
+          {original ? ` ${original} ` : "本机界面字体"}
+          ；也可以改用本机已安装的任意字体
+        </small>
+      </div>
+      <div className="font-options">
+        <button
+          type="button"
+          className={`font-option${usingOriginal ? " active" : ""}`}
+          onClick={() =>
+            void save({ ...settings, fontFamily: "system", fontName: "" })
+          }
+        >
+          <b>原版设计</b>
+          <small>
+            {original || "本机界面字体"}（原版）
+          </small>
+        </button>
+        <button
+          type="button"
+          className={`font-option${usingOriginal ? "" : " active"}`}
+          onClick={() => {
+            setOpen(true);
+            void loadFonts();
+          }}
+        >
+          <b>{usingOriginal ? "选择本机字体" : settings.fontName || "选择本机字体"}</b>
+          <small>
+            {usingOriginal
+              ? `${fonts ? `${fonts.length} 个已安装字体` : "读取本机字体"}`
+              : "当前使用中，点击更换"}
+          </small>
+        </button>
+      </div>
+      {open ? (
+        <div className="font-picker">
+          <input
+            type="search"
+            autoFocus
+            placeholder="搜索字体，例如 微软雅黑 / MiSans"
+            value={query}
+            onChange={(event) => setQuery(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === "Escape") setOpen(false);
+              if (event.key === "Enter" && matches[0]) choose(matches[0]);
+            }}
+          />
+          <div className="font-picker-list">
+            {loading ? (
+              <small className="font-picker-hint">正在读取本机字体…</small>
+            ) : matches.length ? (
+              matches.map((name) => (
+                <button
+                  type="button"
+                  key={name}
+                  className={`font-picker-item${!usingOriginal && settings.fontName === name ? " active" : ""}`}
+                  onClick={() => choose(name)}
+                  style={{ fontFamily: `"${name}"` }}
+                >
+                  {name}
+                </button>
+              ))
+            ) : (
+              <small className="font-picker-hint">
+                {fonts ? "没有匹配的字体" : "读取本机字体…"}
+              </small>
+            )}
+          </div>
+          <button
+            type="button"
+            className="font-picker-close"
+            onClick={() => setOpen(false)}
+          >
+            关闭
+          </button>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
 function Settings({
   settings,
   categories,
@@ -1228,26 +1456,7 @@ function Settings({
   if (!settings) return null;
   return (
     <article className="glass-card settings">
-      <label>
-        <div>
-          <span className="eyebrow">界面字体</span>
-          <b>字体风格</b>
-          <small>字体随安装包提供，切换后立即生效</small>
-        </div>
-        <select
-          value={settings.fontFamily}
-          onChange={(event) =>
-            save({
-              ...settings,
-              fontFamily: event.target.value as FontFamily,
-            })
-          }
-        >
-          <option value="classic">原版设计（默认）</option>
-          <option value="serif">思源宋体</option>
-          <option value="sans">思源黑体</option>
-        </select>
-      </label>
+      <FontSetting settings={settings} save={save} />
       <label>
         <div>
           <span className="eyebrow">自动暂停</span>
